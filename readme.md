@@ -1,3 +1,4 @@
+```
 toolkit
 ├── config
 │   ├── viper.go
@@ -29,3 +30,5 @@ toolkit
 ├── utils                  (pagination, uuid helpers … unchanged)
 └── fx                     (aggregator)
     └── toolkit.go
+
+```
