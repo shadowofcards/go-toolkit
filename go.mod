@@ -1,4 +1,4 @@
-module github.com/leandrodaf/go-toolkit
+module github.com/shadowofcards/go-toolkit
 
 go 1.24.2
 

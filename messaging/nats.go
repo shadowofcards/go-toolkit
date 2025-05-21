@@ -8,7 +8,7 @@ import (
 	"go.uber.org/fx"
 	"go.uber.org/zap"
 
-	"github.com/leandrodaf/go-toolkit/logging"
+	"github.com/shadowofcards/go-toolkit/logging"
 )
 
 type cfg struct {

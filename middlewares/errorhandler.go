@@ -8,7 +8,7 @@ import (
 	"github.com/go-playground/validator/v10"
 	"github.com/gofiber/fiber/v3"
 
-	apperr "github.com/leandrodaf/go-toolkit/errors"
+	apperr "github.com/shadowofcards/go-toolkit/errors"
 )
 
 type errorPayload struct {

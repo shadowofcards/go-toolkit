@@ -10,9 +10,9 @@ import (
 	gjwt "github.com/golang-jwt/jwt/v4"
 	"go.uber.org/zap"
 
-	"github.com/leandrodaf/go-toolkit/contexts"
-	"github.com/leandrodaf/go-toolkit/errors"
-	"github.com/leandrodaf/go-toolkit/logging"
+	"github.com/shadowofcards/go-toolkit/contexts"
+	"github.com/shadowofcards/go-toolkit/errors"
+	"github.com/shadowofcards/go-toolkit/logging"
 )
 
 type tokenValidator interface {

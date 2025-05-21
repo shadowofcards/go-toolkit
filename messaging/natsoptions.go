@@ -5,7 +5,7 @@ import (
 
 	"github.com/nats-io/nats.go"
 
-	"github.com/leandrodaf/go-toolkit/logging"
+	"github.com/shadowofcards/go-toolkit/logging"
 )
 
 type Option func(*cfg)

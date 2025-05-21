@@ -5,8 +5,8 @@ import (
 	"encoding/json"
 	"time"
 
-	"github.com/leandrodaf/go-toolkit/logging"
 	"github.com/nats-io/nats.go"
+	"github.com/shadowofcards/go-toolkit/logging"
 	"go.uber.org/zap"
 )
 

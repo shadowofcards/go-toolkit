@@ -10,9 +10,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/leandrodaf/go-toolkit/contexts"
-	"github.com/leandrodaf/go-toolkit/errors"
-	"github.com/leandrodaf/go-toolkit/logging"
+	"github.com/shadowofcards/go-toolkit/contexts"
+	"github.com/shadowofcards/go-toolkit/errors"
+	"github.com/shadowofcards/go-toolkit/logging"
 	"go.uber.org/zap"
 )
 

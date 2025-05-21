@@ -5,10 +5,10 @@ import (
 	"runtime"
 	"sync"
 
-	"github.com/leandrodaf/go-toolkit/contexts"
-	"github.com/leandrodaf/go-toolkit/logging"
 	"github.com/nats-io/nats.go"
 	"github.com/rs/xid"
+	"github.com/shadowofcards/go-toolkit/contexts"
+	"github.com/shadowofcards/go-toolkit/logging"
 	"go.uber.org/zap"
 )
 

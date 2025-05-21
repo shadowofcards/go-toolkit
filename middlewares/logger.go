@@ -5,7 +5,7 @@ import (
 
 	"github.com/gofiber/fiber/v3"
 	"github.com/gofiber/fiber/v3/middleware/requestid"
-	"github.com/leandrodaf/go-toolkit/logging"
+	"github.com/shadowofcards/go-toolkit/logging"
 	"go.uber.org/zap"
 )
 

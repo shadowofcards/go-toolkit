@@ -5,7 +5,7 @@ import (
 
 	"github.com/gofiber/fiber/v3"
 	"github.com/google/uuid"
-	apperr "github.com/leandrodaf/go-toolkit/errors"
+	apperr "github.com/shadowofcards/go-toolkit/errors"
 )
 
 type PaginationMeta struct {
