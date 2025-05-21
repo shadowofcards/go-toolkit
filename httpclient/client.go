@@ -111,7 +111,7 @@ func (c *BaseClient) Do(ctx context.Context, method, path string, body io.Reader
 		req.Header.Set("Content-Type", "application/json")
 	}
 	if c.authToken != "" {
-		req.Header.Set("Authorization", "Bearer "+c.authToken)
+		req.Header.Set("X-Service-Token", c.authToken)
 	}
 	if c.appName != "" {
 		req.Header.Set("X-App-Name", c.appName)
