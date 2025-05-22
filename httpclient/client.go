@@ -36,11 +36,27 @@ type (
 /*                                 Options                                    */
 /* -------------------------------------------------------------------------- */
 
-func WithHTTPClient(h *http.Client) Option { return func(c *BaseClient) { c.httpClient = h } }
-func WithTimeout(t time.Duration) Option   { return func(c *BaseClient) { c.httpClient.Timeout = t } }
-func WithAuthToken(tk string) Option       { return func(c *BaseClient) { c.authToken = tk } }
-func WithAppName(n string) Option          { return func(c *BaseClient) { c.appName = n } }
-func WithLogger(l *logging.Logger) Option  { return func(c *BaseClient) { c.log = l } }
+func WithHTTPClient(h *http.Client) Option {
+	return func(c *BaseClient) {
+		if h == nil {
+			h = &http.Client{}
+		}
+		c.httpClient = h
+	}
+}
+
+func WithTimeout(t time.Duration) Option {
+	return func(c *BaseClient) {
+		if c.httpClient == nil {
+			c.httpClient = &http.Client{}
+		}
+		c.httpClient.Timeout = t
+	}
+}
+
+func WithAuthToken(tk string) Option      { return func(c *BaseClient) { c.authToken = tk } }
+func WithAppName(n string) Option         { return func(c *BaseClient) { c.appName = n } }
+func WithLogger(l *logging.Logger) Option { return func(c *BaseClient) { c.log = l } }
 
 /* -------------------------------------------------------------------------- */
 /*                               Constructor                                  */
@@ -55,6 +71,11 @@ func New(baseURL string, opts ...Option) *BaseClient {
 	}
 	for _, opt := range opts {
 		opt(bc)
+	}
+	if bc.httpClient == nil {
+		bc.httpClient = &http.Client{Timeout: 10 * time.Second}
+	} else if bc.httpClient.Timeout == 0 {
+		bc.httpClient.Timeout = 10 * time.Second
 	}
 	return bc
 }
@@ -73,9 +94,18 @@ type apiErrPayload struct {
 /* -------------------------------------------------------------------------- */
 
 func (c *BaseClient) Do(ctx context.Context, method, path string, body io.Reader, v any) error {
+
+	if c.httpClient == nil {
+		if c.log != nil {
+			c.log.ErrorCtx(ctx, "nil httpClient detected")
+		}
+		return errors.New().
+			WithCode("NIL_HTTP_CLIENT").
+			WithMessage("httpClient is nil – use httpclient.New or provide one via option")
+	}
+
 	fullURL := c.baseURL + path
 
-	// cancelled before issuing request
 	select {
 	case <-ctx.Done():
 		return errors.New().
@@ -104,8 +134,6 @@ func (c *BaseClient) Do(ctx context.Context, method, path string, body io.Reader
 			WithContext("url", fullURL)
 	}
 
-	/* ------------------------------ headers -------------------------------- */
-
 	req.Header.Set("Accept", "application/json")
 	if body != nil && req.Header.Get("Content-Type") == "" {
 		req.Header.Set("Content-Type", "application/json")
@@ -117,7 +145,6 @@ func (c *BaseClient) Do(ctx context.Context, method, path string, body io.Reader
 		req.Header.Set("X-App-Name", c.appName)
 	}
 
-	// trace headers
 	if rid, ok := ctx.Value(contexts.KeyRequestID).(string); ok {
 		req.Header.Set("X-Request-Id", rid)
 	}
@@ -144,8 +171,6 @@ func (c *BaseClient) Do(ctx context.Context, method, path string, body io.Reader
 	if pid, ok := ctx.Value(contexts.KeyPlayerID).(string); ok {
 		req.Header.Set("X-Player-Id", pid)
 	}
-
-	/* ------------------------------- call ---------------------------------- */
 
 	res, err := c.httpClient.Do(req)
 	if err != nil {
@@ -174,8 +199,6 @@ func (c *BaseClient) Do(ctx context.Context, method, path string, body io.Reader
 
 	bodyBytes, _ := io.ReadAll(res.Body)
 
-	/* ------------------------------ error 4xx/5xx -------------------------- */
-
 	if res.StatusCode >= 400 {
 		var payload apiErrPayload
 		code := fmt.Sprintf("HTTP_%d", res.StatusCode)
@@ -198,8 +221,6 @@ func (c *BaseClient) Do(ctx context.Context, method, path string, body io.Reader
 			WithContext("status", res.StatusCode).
 			WithContext("body", string(bodyBytes))
 	}
-
-	/* ----------------------------- decode body ----------------------------- */
 
 	if v != nil {
 		if err := json.NewDecoder(bytes.NewReader(bodyBytes)).Decode(v); err != nil {
