@@ -26,6 +26,7 @@ type jwtClaims struct {
 	RealmAccess       struct {
 		Roles []string `json:"roles"`
 	} `json:"realm_access"`
+	Exp int64 `json:"exp"`
 }
 
 type AuthMiddleware struct {

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/shadowofcards/go-toolkit/contexts"
@@ -20,12 +21,13 @@ type errorPayload struct {
 	Context interface{} `json:"context,omitempty"`
 }
 
-// Manager knows how to register/unregister connections.
+// Manager knows how to register/unregister connections and refresh sessions.
 type Manager interface {
 	Register(ctx context.Context, id string, conn *websocket.Conn) error
 	Unregister(ctx context.Context, id string) error
 	SendTo(id string, mt int, msg []byte) error
 	Broadcast(mt int, msg []byte)
+	Refresh(ctx context.Context, id string)
 }
 
 // Middleware wraps an http.HandlerFunc.
@@ -41,6 +43,10 @@ type Handler struct {
 	middlewares []Middleware
 	handle      HandlerFunc
 	logger      *logging.Logger
+
+	// heartbeat timeouts
+	pongWait   time.Duration
+	pingPeriod time.Duration
 }
 
 // Option customizes a Handler.
@@ -61,31 +67,38 @@ func WithLogger(log *logging.Logger) Option {
 	return func(h *Handler) { h.logger = log }
 }
 
-// NewHandler builds a Handler with defaults (echo loop, permissive upgrader, global logger).
+// WithPingPong overrides the default ping/pong timings.
+func WithPingPong(pongWait, pingPeriod time.Duration) Option {
+	return func(h *Handler) {
+		h.pongWait = pongWait
+		h.pingPeriod = pingPeriod
+	}
+}
+
+// Default timing for ping/pong to keep session alive.
+const (
+	defaultPongWait   = 60 * time.Second
+	defaultPingPeriod = (defaultPongWait * 9) / 10
+)
+
+// NewHandler builds a Handler with defaults (echo loop, permissive upgrader).
 func NewHandler(m Manager, opts ...Option) *Handler {
+
+	logger, err := logging.New()
+
+	if err != nil {
+		panic("failed to create logger: " + err.Error())
+	}
+
 	h := &Handler{
 		upgrader: websocket.Upgrader{
 			CheckOrigin: func(r *http.Request) bool { return true },
 		},
-		manager: m,
-		handle: func(ctx context.Context, conn *websocket.Conn) {
-			for {
-				mt, msg, err := conn.ReadMessage()
-				if err != nil {
-					return
-				}
-				if err := conn.WriteMessage(mt, msg); err != nil {
-					return
-				}
-			}
-		},
-		logger: func() *logging.Logger {
-			l, err := logging.New()
-			if err != nil {
-				panic("failed to initialize logger: " + err.Error())
-			}
-			return l
-		}(),
+		manager:    m,
+		handle:     defaultEcho,
+		logger:     logger,
+		pongWait:   defaultPongWait,
+		pingPeriod: defaultPingPeriod,
 	}
 	for _, o := range opts {
 		o(h)
@@ -93,23 +106,39 @@ func NewHandler(m Manager, opts ...Option) *Handler {
 	return h
 }
 
+// defaultEcho is the default HandlerFunc: echo back messages.
+func defaultEcho(ctx context.Context, conn *websocket.Conn) {
+	for {
+		mt, msg, err := conn.ReadMessage()
+		if err != nil {
+			return
+		}
+		if err := conn.WriteMessage(mt, msg); err != nil {
+			return
+		}
+	}
+}
+
 // Use appends a Middleware.
 func (h *Handler) Use(mw Middleware) {
 	h.middlewares = append(h.middlewares, mw)
 }
 
-// ServeHTTP implements http.Handler with context propagation, middleware chain, and standardized error handling.
+// ServeHTTP implements http.Handler with context propagation, middleware chain,
+// configurable heartbeat, and standardized error handling.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	final := func(w http.ResponseWriter, r *http.Request) {
-		ctx := r.Context()
-		id, _ := ctx.Value(contexts.KeyPlayerID).(string)
+		ctx, cancel := context.WithCancel(r.Context())
+		defer cancel()
 
+		id, _ := ctx.Value(contexts.KeyPlayerID).(string)
 		conn, err := h.upgrader.Upgrade(w, r, nil)
 		if err != nil {
 			h.handleError(ctx, w, r, err)
 			return
 		}
 		defer conn.Close()
+		h.logger.InfoCtx(ctx, "WebSocket handshake", zap.String("playerID", id))
 
 		if err := h.manager.Register(ctx, id, conn); err != nil {
 			h.handleError(ctx, w, r, err)
@@ -117,15 +146,40 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		defer h.manager.Unregister(ctx, id)
 
+		// setup heartbeat
+		conn.SetReadDeadline(time.Now().Add(h.pongWait))
+		conn.SetPongHandler(func(string) error {
+			h.manager.Refresh(ctx, id)
+			conn.SetReadDeadline(time.Now().Add(h.pongWait))
+			return nil
+		})
+
+		// launch ping routine bound to ctx
+		ticker := time.NewTicker(h.pingPeriod)
+		defer ticker.Stop()
+		go func() {
+			for {
+				select {
+				case <-ticker.C:
+					if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+						cancel()
+						return
+					}
+				case <-ctx.Done():
+					return
+				}
+			}
+		}()
+
+		// invoke business logic
 		h.handle(ctx, conn)
 	}
 
-	// chain middlewares
+	// apply middlewares
 	handler := final
 	for i := len(h.middlewares) - 1; i >= 0; i-- {
 		handler = h.middlewares[i](handler)
 	}
-
 	handler(w, r)
 }
 
@@ -136,25 +190,14 @@ func (h *Handler) handleError(ctx context.Context, w http.ResponseWriter, _ *htt
 		status  int
 	)
 	if ae, ok := apperr.FromError(err); ok {
-		payload = errorPayload{
-			Code:    ae.ErrCode(),
-			Message: ae.Message,
-			Context: ae.Context,
-		}
+		payload = errorPayload{Code: ae.ErrCode(), Message: ae.Message, Context: ae.Context}
 		status = ae.Status()
+		h.logger.WarnCtx(ctx, "WebSocket app error", zap.String("code", payload.Code), zap.Error(err))
 	} else {
-		payload = errorPayload{
-			Code:    "INTERNAL_ERROR",
-			Message: "internal server error",
-		}
+		payload = errorPayload{Code: "INTERNAL_ERROR", Message: "internal server error"}
 		status = http.StatusInternalServerError
+		h.logger.ErrorCtx(ctx, "WebSocket internal error", zap.Error(err))
 	}
-
-	h.logger.ErrorCtx(ctx, "WebSocket error",
-		zap.String("code", payload.Code),
-		zap.Error(err),
-		zap.Any("context", payload.Context),
-	)
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
