@@ -28,12 +28,12 @@ func NewWSAuthMiddleware(
 	return &WSAuthMiddleware{log, validator, serviceToken, appName, env}
 }
 
-// Middleware adapta para o tipo do toolkit: websocket.Middleware
 func (a *WSAuthMiddleware) Middleware() websocket.Middleware {
 	return func(next http.HandlerFunc) http.HandlerFunc {
 		return func(w http.ResponseWriter, r *http.Request) {
+			// start from existing context
 			ctx := r.Context()
-			// traço
+			// trace headers
 			if rid := r.Header.Get("X-Request-Id"); rid != "" {
 				ctx = context.WithValue(ctx, contexts.KeyRequestID, rid)
 			}
@@ -44,13 +44,14 @@ func (a *WSAuthMiddleware) Middleware() websocket.Middleware {
 				ctx = context.WithValue(ctx, contexts.KeyUserAgent, v)
 			}
 
-			// pega token via ?token=
+			// extract token from query
 			token := r.URL.Query().Get("token")
 			if token == "" {
 				writeError(w, http.StatusUnauthorized, "MISSING_TOKEN", "missing token query parameter")
 				return
 			}
-			// service-token
+
+			// service token shortcut
 			if token == a.serviceToken {
 				ctx = context.WithValue(ctx, contexts.KeyUserID, a.appName)
 				ctx = context.WithValue(ctx, contexts.KeyUsername, a.appName)
@@ -58,14 +59,19 @@ func (a *WSAuthMiddleware) Middleware() websocket.Middleware {
 				next(w, r.WithContext(ctx))
 				return
 			}
-			// valida JWT
+
+			// validate JWT
 			var claims jwtClaims
 			if err := a.validator.Validate(token, &claims, a.env == "production"); err != nil {
 				a.log.ErrorCtx(ctx, "jwt validation failed", zap.Error(err))
 				writeError(w, http.StatusUnauthorized, "INVALID_TOKEN", "invalid or expired token")
 				return
 			}
-			// injeta claims
+
+			// debug-log full claims
+			a.log.DebugCtx(ctx, "decoded JWT claims", zap.Any("claims", claims))
+
+			// inject into context
 			userID := claims.Subject
 			if userID == "" {
 				userID = claims.PlayerID
