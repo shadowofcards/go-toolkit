@@ -8,6 +8,7 @@ require (
 	github.com/gofiber/fiber/v3 v3.0.0-beta.4
 	github.com/golang-jwt/jwt/v4 v4.5.2
 	github.com/google/uuid v1.6.0
+	github.com/gorilla/websocket v1.5.3
 	github.com/nats-io/nats.go v1.42.0
 	github.com/rs/xid v1.6.0
 	github.com/spf13/viper v1.20.1
