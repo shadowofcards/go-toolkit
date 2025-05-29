@@ -1,11 +1,9 @@
-// internal/system/http/middlewares/ws_auth.go
 package middlewares
 
 import (
 	"context"
 	"encoding/json"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/shadowofcards/go-toolkit/contexts"
@@ -15,28 +13,42 @@ import (
 	"go.uber.org/zap"
 )
 
+// TokenIntrospector defines the interface para introspecção de tokens.
 type TokenIntrospector interface {
 	Introspect(ctx context.Context, token string) (map[string]interface{}, error)
 }
 
-type WSAuthOption func(*WSAuthMiddleware)
+// TokenIntrospectorFunc adapta uma função para TokenIntrospector.
+type TokenIntrospectorFunc func(ctx context.Context, token string) (map[string]interface{}, error)
 
-func WithIntrospector(intro TokenIntrospector) WSAuthOption {
-	return func(m *WSAuthMiddleware) { m.introspector = intro }
+func (f TokenIntrospectorFunc) Introspect(ctx context.Context, token string) (map[string]interface{}, error) {
+	return f(ctx, token)
 }
 
+// WSAuthOption customiza o middleware.
+type WSAuthOption func(*WSAuthMiddleware)
+
+// WithIntrospector adiciona suporte a introspecção remota de token.
+func WithIntrospector(introspector TokenIntrospector) WSAuthOption {
+	return func(m *WSAuthMiddleware) {
+		m.introspector = introspector
+	}
+}
+
+// WSAuthMiddleware autentica handshakes WebSocket via ?token=,
+// usando JWT local ou introspecção via TokenIntrospector.
 type WSAuthMiddleware struct {
 	log          *logging.Logger
 	validator    tokenValidator
 	introspector TokenIntrospector
 	serviceToken string
-	appName, env string
+	appName      string
+	env          string
 	maxTokenAge  time.Duration
 }
 
-// NewWSAuthMiddleware constructs a WSAuthMiddleware.
-// Pass WithIntrospector(...) to enable introspection, and
-// pass a maxTokenAge to reject tokens older than that.
+// NewWSAuthMiddleware cria o middleware. maxTokenAge=0 desabilita checagem de idade.
+// Passe WithIntrospector(...) para habilitar introspecção remota.
 func NewWSAuthMiddleware(
 	log *logging.Logger,
 	validator tokenValidator,
@@ -44,18 +56,25 @@ func NewWSAuthMiddleware(
 	maxTokenAge time.Duration,
 	opts ...WSAuthOption,
 ) *WSAuthMiddleware {
-	m := &WSAuthMiddleware{log: log, validator: validator, serviceToken: serviceToken, appName: appName, env: env, maxTokenAge: maxTokenAge}
+	m := &WSAuthMiddleware{
+		log:          log,
+		validator:    validator,
+		serviceToken: serviceToken,
+		appName:      appName,
+		env:          env,
+		maxTokenAge:  maxTokenAge,
+	}
 	for _, o := range opts {
 		o(m)
 	}
 	return m
 }
 
+// Middleware adapta ao tipo websocket.Middleware do toolkit.
 func (a *WSAuthMiddleware) Middleware() websocket.Middleware {
 	return func(next http.HandlerFunc) http.HandlerFunc {
 		return func(w http.ResponseWriter, r *http.Request) {
 			ctx := r.Context()
-			// trace headers
 			if rid := r.Header.Get("X-Request-Id"); rid != "" {
 				ctx = context.WithValue(ctx, contexts.KeyRequestID, rid)
 			}
@@ -77,12 +96,11 @@ func (a *WSAuthMiddleware) Middleware() websocket.Middleware {
 				return
 			}
 
-			// constant-time service token check
-			if strings.EqualFold(token, a.serviceToken) {
-				a.log.InfoCtx(ctx, "service token auth", zap.String("service", a.appName))
+			if token == a.serviceToken {
 				ctx = context.WithValue(ctx, contexts.KeyUserID, a.appName)
 				ctx = context.WithValue(ctx, contexts.KeyUsername, a.appName)
 				ctx = context.WithValue(ctx, contexts.KeyUserRoles, []string{"service"})
+				a.log.InfoCtx(ctx, "service token authenticated")
 				next(w, r.WithContext(ctx))
 				return
 			}
@@ -101,7 +119,7 @@ func (a *WSAuthMiddleware) Middleware() websocket.Middleware {
 				}
 				data, _ := json.Marshal(raw)
 				if err := json.Unmarshal(data, &claims); err != nil {
-					a.log.ErrorCtx(ctx, "parse introspected claims failed", zap.Error(err))
+					a.log.ErrorCtx(ctx, "parse introspection failed", zap.Error(err))
 					writeError(w, apperr.New().
 						WithHTTPStatus(http.StatusInternalServerError).
 						WithCode("CLAIM_PARSE_ERROR").
@@ -121,17 +139,14 @@ func (a *WSAuthMiddleware) Middleware() websocket.Middleware {
 				}
 			}
 
-			// optional token age check
-			if a.maxTokenAge > 0 {
-				if time.Now().Unix()-claims.Exp > int64(a.maxTokenAge.Seconds()) {
-					writeError(w, apperr.New().
-						WithHTTPStatus(http.StatusUnauthorized).
-						WithCode("TOKEN_EXPIRED").
-						WithMessage("token too old"),
-					)
-					a.log.WarnCtx(ctx, "token expired by age")
-					return
-				}
+			if a.maxTokenAge > 0 && time.Now().Unix()-claims.Exp > int64(a.maxTokenAge.Seconds()) {
+				a.log.WarnCtx(ctx, "token expired by age")
+				writeError(w, apperr.New().
+					WithHTTPStatus(http.StatusUnauthorized).
+					WithCode("TOKEN_EXPIRED").
+					WithMessage("token too old"),
+				)
+				return
 			}
 
 			if a.env != "production" {
@@ -140,7 +155,6 @@ func (a *WSAuthMiddleware) Middleware() websocket.Middleware {
 				a.log.InfoCtx(ctx, "token authenticated", zap.String("user", claims.PreferredUsername))
 			}
 
-			// inject into context
 			userID := claims.Subject
 			if userID == "" {
 				userID = claims.PlayerID
