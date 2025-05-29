@@ -3,11 +3,22 @@ package websocket
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 
 	"github.com/gorilla/websocket"
 	"github.com/shadowofcards/go-toolkit/contexts"
+	apperr "github.com/shadowofcards/go-toolkit/errors"
+	"github.com/shadowofcards/go-toolkit/logging"
+	"go.uber.org/zap"
 )
+
+// errorPayload mirrors the Fiber JSON error payload.
+type errorPayload struct {
+	Code    string      `json:"code"`
+	Message string      `json:"message"`
+	Context interface{} `json:"context,omitempty"`
+}
 
 // Manager knows how to register/unregister connections.
 type Manager interface {
@@ -29,6 +40,7 @@ type Handler struct {
 	manager     Manager
 	middlewares []Middleware
 	handle      HandlerFunc
+	logger      *logging.Logger
 }
 
 // Option customizes a Handler.
@@ -36,19 +48,20 @@ type Option func(*Handler)
 
 // WithUpgrader overrides the default upgrader.
 func WithUpgrader(u websocket.Upgrader) Option {
-	return func(h *Handler) {
-		h.upgrader = u
-	}
+	return func(h *Handler) { h.upgrader = u }
 }
 
 // WithHandlerFunc sets the core message loop.
 func WithHandlerFunc(fn HandlerFunc) Option {
-	return func(h *Handler) {
-		h.handle = fn
-	}
+	return func(h *Handler) { h.handle = fn }
 }
 
-// NewHandler builds a Handler with defaults (echo).
+// WithLogger injects a go-toolkit Logger for internal logs.
+func WithLogger(log *logging.Logger) Option {
+	return func(h *Handler) { h.logger = log }
+}
+
+// NewHandler builds a Handler with defaults (echo loop, permissive upgrader, global logger).
 func NewHandler(m Manager, opts ...Option) *Handler {
 	h := &Handler{
 		upgrader: websocket.Upgrader{
@@ -66,6 +79,13 @@ func NewHandler(m Manager, opts ...Option) *Handler {
 				}
 			}
 		},
+		logger: func() *logging.Logger {
+			l, err := logging.New()
+			if err != nil {
+				panic("failed to initialize logger: " + err.Error())
+			}
+			return l
+		}(),
 	}
 	for _, o := range opts {
 		o(h)
@@ -78,29 +98,65 @@ func (h *Handler) Use(mw Middleware) {
 	h.middlewares = append(h.middlewares, mw)
 }
 
-// ServeHTTP implements http.Handler.
+// ServeHTTP implements http.Handler with context propagation, middleware chain, and standardized error handling.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	// extract ID from context (e.g. playerID)
-	id, _ := ctx.Value(contexts.KeyPlayerID).(string)
-
 	final := func(w http.ResponseWriter, r *http.Request) {
+		ctx := r.Context()
+		id, _ := ctx.Value(contexts.KeyPlayerID).(string)
+
 		conn, err := h.upgrader.Upgrade(w, r, nil)
 		if err != nil {
+			h.handleError(ctx, w, r, err)
 			return
 		}
 		defer conn.Close()
 
-		_ = h.manager.Register(ctx, id, conn)
+		if err := h.manager.Register(ctx, id, conn); err != nil {
+			h.handleError(ctx, w, r, err)
+			return
+		}
 		defer h.manager.Unregister(ctx, id)
 
 		h.handle(ctx, conn)
 	}
 
 	// chain middlewares
-	fn := final
+	handler := final
 	for i := len(h.middlewares) - 1; i >= 0; i-- {
-		fn = h.middlewares[i](fn)
+		handler = h.middlewares[i](handler)
 	}
-	fn(w, r)
+
+	handler(w, r)
+}
+
+// handleError standardizes error responses using go-toolkit/errors.AppError.
+func (h *Handler) handleError(ctx context.Context, w http.ResponseWriter, _ *http.Request, err error) {
+	var (
+		payload errorPayload
+		status  int
+	)
+	if ae, ok := apperr.FromError(err); ok {
+		payload = errorPayload{
+			Code:    ae.ErrCode(),
+			Message: ae.Message,
+			Context: ae.Context,
+		}
+		status = ae.Status()
+	} else {
+		payload = errorPayload{
+			Code:    "INTERNAL_ERROR",
+			Message: "internal server error",
+		}
+		status = http.StatusInternalServerError
+	}
+
+	h.logger.ErrorCtx(ctx, "WebSocket error",
+		zap.String("code", payload.Code),
+		zap.Error(err),
+		zap.Any("context", payload.Context),
+	)
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{"error": payload})
 }
