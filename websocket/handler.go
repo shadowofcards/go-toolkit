@@ -124,20 +124,35 @@ func (h *Handler) Use(mw Middleware) {
 	h.middlewares = append(h.middlewares, mw)
 }
 
-// ServeHTTP implements http.Handler with context propagation, middleware chain,
-// configurable heartbeat, and standardized error handling.
+// closeConnection envia o frame de Close e fecha a conexão
+func (h *Handler) closeConnection(conn *websocket.Conn, code int, text string) {
+	// tenta enviar um CloseFrame com timeout de 5s
+	if err := conn.WriteControl(
+		websocket.CloseMessage,
+		websocket.FormatCloseMessage(code, text),
+		time.Now().Add(5*time.Second),
+	); err != nil {
+		h.logger.Warn("failed to send close frame", zap.Error(err))
+	}
+	conn.Close()
+}
+
+// ServeHTTP implementa http.Handler com heartbeat "server-pull" e clean close
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	final := func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithCancel(r.Context())
 		defer cancel()
 
 		id, _ := ctx.Value(contexts.KeyPlayerID).(string)
+
 		conn, err := h.upgrader.Upgrade(w, r, nil)
 		if err != nil {
 			h.handleError(ctx, w, r, err)
 			return
 		}
-		defer conn.Close()
+		// clean close via helper
+		defer h.closeConnection(conn, websocket.CloseNormalClosure, "server shutdown")
+
 		h.logger.InfoCtx(ctx, "WebSocket handshake", zap.String("playerID", id))
 
 		if err := h.manager.Register(ctx, id, conn); err != nil {
@@ -146,36 +161,34 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		defer h.manager.Unregister(ctx, id)
 
-		// setup heartbeat
-		conn.SetReadDeadline(time.Now().Add(h.pongWait))
-		conn.SetPongHandler(func(string) error {
-			h.manager.Refresh(ctx, id)
-			conn.SetReadDeadline(time.Now().Add(h.pongWait))
-			return nil
-		})
-
-		// launch ping routine bound to ctx
+		// HEARTBEAT "SERVER-PULL"
 		ticker := time.NewTicker(h.pingPeriod)
 		defer ticker.Stop()
+
 		go func() {
 			for {
 				select {
 				case <-ticker.C:
-					if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+					// ping de controle; falha = desconexão
+					if err := conn.WriteControl(
+						websocket.PingMessage,
+						nil,
+						time.Now().Add(5*time.Second),
+					); err != nil {
 						cancel()
 						return
 					}
+					h.manager.Refresh(ctx, id)
+
 				case <-ctx.Done():
 					return
 				}
 			}
 		}()
 
-		// invoke business logic
 		h.handle(ctx, conn)
 	}
 
-	// apply middlewares
 	handler := final
 	for i := len(h.middlewares) - 1; i >= 0; i-- {
 		handler = h.middlewares[i](handler)
