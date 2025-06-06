@@ -1,4 +1,3 @@
-// go-toolkit/websocket/handler.go
 package websocket
 
 import (
@@ -30,6 +29,11 @@ type Manager interface {
 	Refresh(ctx context.Context, id string)
 }
 
+// HeartbeatPublisher defines how to publish a heartbeat event (e.g., to NATS).
+type HeartbeatPublisher interface {
+	PublishHeartbeat(ctx context.Context, id string) error
+}
+
 // Middleware wraps an http.HandlerFunc.
 type Middleware func(next http.HandlerFunc) http.HandlerFunc
 
@@ -38,11 +42,12 @@ type HandlerFunc func(ctx context.Context, conn *websocket.Conn)
 
 // Handler is the generic WebSocket HTTP handler.
 type Handler struct {
-	upgrader    websocket.Upgrader
-	manager     Manager
-	middlewares []Middleware
-	handle      HandlerFunc
-	logger      *logging.Logger
+	upgrader           websocket.Upgrader
+	manager            Manager
+	middlewares        []Middleware
+	handle             HandlerFunc
+	logger             *logging.Logger
+	heartbeatPublisher HeartbeatPublisher
 
 	// heartbeat timeouts
 	pongWait   time.Duration
@@ -75,6 +80,11 @@ func WithPingPong(pongWait, pingPeriod time.Duration) Option {
 	}
 }
 
+// WithHeartbeatPublisher sets a HeartbeatPublisher to emit heartbeat events.
+func WithHeartbeatPublisher(p HeartbeatPublisher) Option {
+	return func(h *Handler) { h.heartbeatPublisher = p }
+}
+
 // Default timing for ping/pong to keep session alive.
 const (
 	defaultPongWait   = 60 * time.Second
@@ -83,9 +93,7 @@ const (
 
 // NewHandler builds a Handler with defaults (echo loop, permissive upgrader).
 func NewHandler(m Manager, opts ...Option) *Handler {
-
 	logger, err := logging.New()
-
 	if err != nil {
 		panic("failed to create logger: " + err.Error())
 	}
@@ -179,6 +187,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 						return
 					}
 					h.manager.Refresh(ctx, id)
+
+					if h.heartbeatPublisher != nil {
+						go func() {
+							if err := h.heartbeatPublisher.PublishHeartbeat(ctx, id); err != nil {
+								h.logger.WarnCtx(ctx, "heartbeat publish failed", zap.Error(err))
+							}
+						}()
+					}
 
 				case <-ctx.Done():
 					return
