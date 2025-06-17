@@ -9,6 +9,8 @@ import (
 type Validator interface {
 	Struct(any) error
 	StructCtx(context.Context, any) error
+	Var(any, string) error
+	VarCtx(context.Context, any, string) error
 }
 
 type Option func(*validator.Validate) error
