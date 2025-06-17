@@ -7,39 +7,53 @@ import (
 	"strings"
 	"time"
 
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/shadowofcards/go-toolkit/contexts"
 	apperr "github.com/shadowofcards/go-toolkit/errors"
+	gtkjwt "github.com/shadowofcards/go-toolkit/jwt"
 	"github.com/shadowofcards/go-toolkit/logging"
 	"github.com/shadowofcards/go-toolkit/websocket"
 	"go.uber.org/zap"
 )
 
-// TokenIntrospector defines the interface for remote token lookup.
+var (
+	ErrMissingToken      = apperr.New().WithHTTPStatus(http.StatusUnauthorized).WithCode("MISSING_TOKEN").WithMessage("missing token")
+	ErrTokenExpiredByAge = apperr.New().WithHTTPStatus(http.StatusUnauthorized).WithCode("TOKEN_EXPIRED").WithMessage("token too old")
+	ErrMissingClaim      = apperr.New().WithHTTPStatus(http.StatusUnauthorized).WithCode("MISSING_CLAIM").WithMessage("no subject or player_id in token")
+)
+
+type wsJWTClaims struct {
+	jwt.RegisteredClaims
+	PlayerID          string `json:"player_id"`
+	PreferredUsername string `json:"preferred_username"`
+	RealmAccess       struct {
+		Roles []string `json:"roles"`
+	} `json:"realm_access"`
+	Tid   string   `json:"tid"`
+	Perms []string `json:"perms"`
+}
+
 type TokenIntrospector interface {
 	Introspect(ctx context.Context, token string) (map[string]interface{}, error)
 }
 
-// TokenIntrospectorFunc adapts a function to TokenIntrospector.
 type TokenIntrospectorFunc func(ctx context.Context, token string) (map[string]interface{}, error)
 
 func (f TokenIntrospectorFunc) Introspect(ctx context.Context, token string) (map[string]interface{}, error) {
 	return f(ctx, token)
 }
 
-// WSAuthOption allows customizing WSAuthMiddleware behavior.
 type WSAuthOption func(*WSAuthMiddleware)
 
-// WithIntrospector enables remote introspection of tokens.
 func WithIntrospector(introspector TokenIntrospector) WSAuthOption {
 	return func(m *WSAuthMiddleware) {
 		m.introspector = introspector
 	}
 }
 
-// WSAuthMiddleware handles WebSocket auth via JWT in ?token= or service token.
 type WSAuthMiddleware struct {
 	log          *logging.Logger
-	validator    tokenValidator
+	verifier     *gtkjwt.Verifier
 	introspector TokenIntrospector
 	serviceToken string
 	appName      string
@@ -47,19 +61,16 @@ type WSAuthMiddleware struct {
 	maxTokenAge  time.Duration
 }
 
-// NewWSAuthMiddleware creates a middleware instance.
-// maxTokenAge==0 disables token-age checks.
-// Pass WithIntrospector(...) to enable remote introspection.
 func NewWSAuthMiddleware(
 	log *logging.Logger,
-	validator tokenValidator,
+	verifier *gtkjwt.Verifier,
 	serviceToken, appName, env string,
 	maxTokenAge time.Duration,
 	opts ...WSAuthOption,
 ) *WSAuthMiddleware {
 	m := &WSAuthMiddleware{
 		log:          log,
-		validator:    validator,
+		verifier:     verifier,
 		serviceToken: serviceToken,
 		appName:      appName,
 		env:          env,
@@ -71,35 +82,18 @@ func NewWSAuthMiddleware(
 	return m
 }
 
-// Middleware adapts WSAuthMiddleware into the toolkit's websocket.Middleware.
 func (a *WSAuthMiddleware) Middleware() websocket.Middleware {
 	return func(next http.HandlerFunc) http.HandlerFunc {
 		return func(w http.ResponseWriter, r *http.Request) {
 			ctx := r.Context()
 
-			// propagate tracing headers
-			if rid := r.Header.Get("X-Request-Id"); rid != "" {
-				ctx = context.WithValue(ctx, contexts.KeyRequestID, rid)
-			}
-			if v := r.Header.Get("X-App-Name"); v != "" {
-				ctx = context.WithValue(ctx, contexts.KeyOrigin, v)
-			}
-			if v := r.Header.Get("X-User-Agent"); v != "" {
-				ctx = context.WithValue(ctx, contexts.KeyUserAgent, v)
-			}
-
 			token := r.URL.Query().Get("token")
 			if token == "" {
-				writeError(w, apperr.New().
-					WithHTTPStatus(http.StatusUnauthorized).
-					WithCode("MISSING_TOKEN").
-					WithMessage("missing token"),
-				)
+				writeError(w, ErrMissingToken)
 				a.log.WarnCtx(ctx, "missing token query parameter")
 				return
 			}
 
-			// service-token shortcut
 			if strings.EqualFold(token, a.serviceToken) {
 				ctx = context.WithValue(ctx, contexts.KeyUserID, a.appName)
 				ctx = context.WithValue(ctx, contexts.KeyUsername, a.appName)
@@ -109,69 +103,48 @@ func (a *WSAuthMiddleware) Middleware() websocket.Middleware {
 				return
 			}
 
-			// optionally introspect to confirm active
 			if a.introspector != nil {
 				if _, err := a.introspector.Introspect(ctx, token); err != nil {
 					a.log.WarnCtx(ctx, "token introspection failed", zap.Error(err))
-					writeError(w, apperr.New().
-						WithHTTPStatus(http.StatusUnauthorized).
-						WithCode("INVALID_TOKEN").
-						WithMessage("invalid token"),
-					)
+					writeError(w, ErrInvalidToken)
 					return
 				}
 			}
 
-			// parse and validate JWT claims
-			var claims jwtClaims
-			if err := a.validator.Validate(token, &claims, a.env == "production"); err != nil {
+			var claims wsJWTClaims
+			allowExpired := a.env != "production"
+			if err := a.verifier.Validate(ctx, token, &claims, allowExpired); err != nil {
 				a.log.WarnCtx(ctx, "jwt validation failed", zap.Error(err))
-				writeError(w, apperr.New().
-					WithHTTPStatus(http.StatusUnauthorized).
-					WithCode("INVALID_TOKEN").
-					WithMessage("invalid or expired token"),
-				)
+				writeError(w, ErrInvalidToken)
 				return
 			}
 
-			// optional token age check
-			if a.maxTokenAge > 0 && time.Now().Unix()-claims.Exp > int64(a.maxTokenAge.Seconds()) {
-				a.log.WarnCtx(ctx, "token expired by age")
-				writeError(w, apperr.New().
-					WithHTTPStatus(http.StatusUnauthorized).
-					WithCode("TOKEN_EXPIRED").
-					WithMessage("token too old"),
-				)
-				return
+			if a.maxTokenAge > 0 && claims.IssuedAt != nil {
+				age := time.Since(claims.IssuedAt.Time)
+				if age > a.maxTokenAge {
+					a.log.WarnCtx(ctx, "token expired by age")
+					writeError(w, ErrTokenExpiredByAge)
+					return
+				}
 			}
 
-			// log summary
-			if a.env != "production" {
-				a.log.DebugCtx(ctx, "authenticated token claims", zap.Any("claims", claims))
-			} else {
-				a.log.InfoCtx(ctx, "token authenticated", zap.String("user", claims.PreferredUsername))
-			}
-
-			// extract playerID (fallback to Subject)
 			userID := claims.Subject
 			if userID == "" {
 				userID = claims.PlayerID
 			}
 			if userID == "" {
-				writeError(w, apperr.New().
-					WithHTTPStatus(http.StatusUnauthorized).
-					WithCode("MISSING_CLAIM").
-					WithMessage("no subject or player_id in token"),
-				)
-				a.log.WarnCtx(ctx, "no playerID or sub in token")
+				writeError(w, ErrMissingClaim)
+				a.log.WarnCtx(ctx, "no subject or player_id in token")
 				return
 			}
 
-			// inject into context
+			roles := claims.RealmAccess.Roles
+			roles = append(roles, claims.Perms...)
+
+			ctx = context.WithValue(ctx, contexts.KeyTenantID, claims.Tid)
 			ctx = context.WithValue(ctx, contexts.KeyUserID, userID)
 			ctx = context.WithValue(ctx, contexts.KeyUsername, claims.PreferredUsername)
-			ctx = context.WithValue(ctx, contexts.KeyUserRoles, claims.RealmAccess.Roles)
-			ctx = context.WithValue(ctx, contexts.KeyPlayerID, claims.PlayerID)
+			ctx = context.WithValue(ctx, contexts.KeyUserRoles, roles)
 
 			next(w, r.WithContext(ctx))
 		}

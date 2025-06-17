@@ -3,10 +3,9 @@ module github.com/shadowofcards/go-toolkit
 go 1.24.2
 
 require (
-	github.com/MicahParks/keyfunc v1.9.0
 	github.com/go-playground/validator/v10 v10.26.0
 	github.com/gofiber/fiber/v3 v3.0.0-beta.4
-	github.com/golang-jwt/jwt/v4 v4.5.2
+	github.com/golang-jwt/jwt/v5 v5.2.2
 	github.com/google/uuid v1.6.0
 	github.com/gorilla/websocket v1.5.3
 	github.com/nats-io/nats.go v1.42.0
@@ -17,6 +16,12 @@ require (
 )
 
 require (
+	github.com/MicahParks/jwkset v0.8.0 // indirect
+	golang.org/x/time v0.9.0 // indirect
+)
+
+require (
+	github.com/MicahParks/keyfunc/v3 v3.4.0
 	github.com/andybalholm/brotli v1.1.1 // indirect
 	github.com/fsnotify/fsnotify v1.8.0 // indirect
 	github.com/fxamacker/cbor/v2 v2.7.0 // indirect

@@ -1,89 +1,100 @@
 package jwt
 
 import (
-	"crypto/tls"
+	"context"
 	"errors"
 	"net/http"
 	"strings"
 	"time"
 
-	"github.com/MicahParks/keyfunc"
-	gjwt "github.com/golang-jwt/jwt/v4"
+	"github.com/MicahParks/keyfunc/v3"
+	gjwt "github.com/golang-jwt/jwt/v5"
+
+	apperrors "github.com/shadowofcards/go-toolkit/errors"
 )
 
-type Verifier struct{ jwks *keyfunc.JWKS }
+var (
+	ErrConfig = apperrors.New().
+			WithHTTPStatus(http.StatusInternalServerError).
+			WithCode("JWT_CONFIG_ERROR").
+			WithMessage("JWT configuration is invalid")
 
-type cfg struct {
-	issuer            string
-	jwksURL           string
-	skipTLSVerify     bool
-	httpClient        *http.Client
-	refreshInterval   time.Duration
-	refreshUnknownKID bool
-	errHandler        func(error)
+	ErrJWKSParse = apperrors.New().
+			WithHTTPStatus(http.StatusInternalServerError).
+			WithCode("JWKS_PARSE_ERROR").
+			WithMessage("failed to parse JWK Set")
+
+	ErrInvalidToken = apperrors.New().
+			WithHTTPStatus(http.StatusUnauthorized).
+			WithCode("INVALID_JWT").
+			WithMessage("invalid or expired token")
+)
+
+type Verifier struct {
+	kf keyfunc.Keyfunc
 }
 
 func New(opts ...Option) (*Verifier, error) {
-	c := &cfg{
-		refreshInterval:   time.Hour,
-		refreshUnknownKID: true,
-		errHandler:        func(error) {},
-	}
-
-	for _, opt := range opts {
-		opt(c)
-	}
-
-	if c.jwksURL == "" && c.issuer == "" {
-		return nil, errors.New("jwt: either issuer or jwks URL must be set")
-	}
-	if c.jwksURL == "" {
-		iss := strings.TrimRight(c.issuer, "/")
-		c.jwksURL = iss + "/protocol/openid-connect/certs"
-	}
-
-	if c.httpClient == nil {
-		if c.skipTLSVerify {
-			c.httpClient = &http.Client{
-				Timeout: 10 * time.Second,
-				Transport: &http.Transport{
-					TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-				},
-			}
-		} else {
-			c.httpClient = http.DefaultClient
+	cfg := &config{refreshInterval: time.Hour}
+	for _, o := range opts {
+		if err := o(cfg); err != nil {
+			return nil, ErrConfig.WithError(err)
 		}
 	}
 
-	jwks, err := keyfunc.Get(c.jwksURL, keyfunc.Options{
-		Client:            c.httpClient,
-		RefreshInterval:   c.refreshInterval,
-		RefreshUnknownKID: c.refreshUnknownKID,
-		RefreshErrorHandler: func(err error) {
-			c.errHandler(err)
-		},
-	})
-	if err != nil {
-		return nil, err
+	var kf keyfunc.Keyfunc
+	var err error
+
+	if len(cfg.jwksJSON) > 0 {
+
+		kf, err = keyfunc.NewJWKSetJSON(cfg.jwksJSON)
+		if err != nil {
+			return nil, ErrJWKSParse.WithError(err)
+		}
+	} else {
+
+		if cfg.jwksURL == "" && cfg.issuer == "" {
+			return nil, ErrConfig
+		}
+		if cfg.jwksURL == "" {
+			iss := strings.TrimRight(cfg.issuer, "/")
+			cfg.jwksURL = iss + "/protocol/openid-connect/certs"
+		}
+
+		kf, err = keyfunc.NewDefaultOverrideCtx(
+			context.Background(),
+			[]string{cfg.jwksURL},
+			keyfunc.Override{
+				RefreshInterval: cfg.refreshInterval,
+			},
+		)
+		if err != nil {
+			return nil, ErrJWKSParse.WithError(err)
+		}
 	}
 
-	return &Verifier{jwks: jwks}, nil
+	return &Verifier{kf: kf}, nil
 }
 
-func (v *Verifier) Shutdown() { v.jwks.EndBackground() }
-
-func (v *Verifier) Validate(tokenString string, claims gjwt.Claims, allowExpired bool) error {
-	parsed, err := gjwt.ParseWithClaims(tokenString, claims, v.jwks.Keyfunc)
+func (v *Verifier) Validate(
+	ctx context.Context,
+	tokenString string,
+	claims gjwt.Claims,
+	allowExpired bool,
+) error {
+	token, err := gjwt.ParseWithClaims(
+		tokenString,
+		claims,
+		v.kf.KeyfuncCtx(ctx),
+	)
 	if err != nil {
-		if errors.Is(err, gjwt.ErrTokenExpired) && allowExpired {
+		if allowExpired && errors.Is(err, gjwt.ErrTokenExpired) {
 			return nil
 		}
-		return err
+		return ErrInvalidToken.WithError(err)
 	}
-	if !parsed.Valid && !(allowExpired && isOnlyExpiredErr(parsed)) {
-		return errors.New("invalid token")
+	if !token.Valid {
+		return ErrInvalidToken
 	}
 	return nil
 }
-
-func isOnlyExpiredErr(t *gjwt.Token) bool { return t != nil && !t.Valid }
