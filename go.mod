@@ -8,6 +8,7 @@ require (
 	github.com/golang-jwt/jwt/v5 v5.2.2
 	github.com/google/uuid v1.6.0
 	github.com/gorilla/websocket v1.5.3
+	github.com/influxdata/influxdb-client-go/v2 v2.14.0
 	github.com/nats-io/nats.go v1.42.0
 	github.com/rs/xid v1.6.0
 	github.com/spf13/viper v1.20.1
@@ -17,6 +18,9 @@ require (
 
 require (
 	github.com/MicahParks/jwkset v0.8.0 // indirect
+	github.com/apapsch/go-jsonmerge/v2 v2.0.0 // indirect
+	github.com/influxdata/line-protocol v0.0.0-20200327222509-2487e7298839 // indirect
+	github.com/oapi-codegen/runtime v1.0.0 // indirect
 	golang.org/x/time v0.9.0 // indirect
 )
 

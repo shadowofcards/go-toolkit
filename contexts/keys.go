@@ -11,4 +11,5 @@ const (
 	KeyRequestID contextKey = "requestID"
 	KeyOrigin    contextKey = "origin"
 	KeyUserAgent contextKey = "userAgent"
+	KeyRegion    contextKey = "region"
 )
