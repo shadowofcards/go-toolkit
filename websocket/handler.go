@@ -4,103 +4,216 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"net/url"
+	"sync"
 	"time"
 
-	"github.com/gorilla/websocket"
+	httpws "github.com/gorilla/websocket"
+	"go.uber.org/zap"
+
 	"github.com/shadowofcards/go-toolkit/contexts"
 	apperr "github.com/shadowofcards/go-toolkit/errors"
 	"github.com/shadowofcards/go-toolkit/logging"
-	"go.uber.org/zap"
 )
 
-// errorPayload mirrors the Fiber JSON error payload.
+/*──────────────────────────────
+   CONNECTION WRAPPER
+──────────────────────────────*/
+
+type SafeConn struct {
+	*httpws.Conn
+	mu sync.Mutex
+}
+
+func (c *SafeConn) WriteMessage(mt int, data []byte) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.Conn.WriteMessage(mt, data)
+}
+
+func (c *SafeConn) WriteControl(mt int, data []byte, deadline time.Time) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.Conn.WriteControl(mt, data, deadline)
+}
+
+/*──────────────────────────────
+   MANAGER
+──────────────────────────────*/
+
+type Manager interface {
+	Register(ctx context.Context, id string, raw *httpws.Conn) error
+	Unregister(ctx context.Context, id string)
+	JoinRoom(id, room string)
+	LeaveRoom(id, room string)
+	SendTo(id string, mt int, msg []byte) error
+	SendToRoom(room string, mt int, msg []byte)
+	Broadcast(mt int, msg []byte)
+	Refresh(ctx context.Context, id string)
+}
+
+type manager struct {
+	conns map[string]*SafeConn
+	rooms map[string]map[string]struct{}
+	mu    sync.RWMutex
+}
+
+func NewManager() Manager {
+	return &manager{
+		conns: make(map[string]*SafeConn),
+		rooms: make(map[string]map[string]struct{}),
+	}
+}
+
+func (m *manager) Register(_ context.Context, id string, raw *httpws.Conn) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.conns[id]; ok {
+		return apperr.New().WithHTTPStatus(http.StatusConflict).WithCode("ALREADY_CONNECTED").WithMessage("connection exists")
+	}
+	m.conns[id] = &SafeConn{Conn: raw}
+	return nil
+}
+
+func (m *manager) Unregister(_ context.Context, id string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if c, ok := m.conns[id]; ok {
+		_ = c.Close()
+		delete(m.conns, id)
+	}
+	for room, set := range m.rooms {
+		delete(set, id)
+		if len(set) == 0 {
+			delete(m.rooms, room)
+		}
+	}
+}
+
+func (m *manager) JoinRoom(id, room string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	set, ok := m.rooms[room]
+	if !ok {
+		set = make(map[string]struct{})
+		m.rooms[room] = set
+	}
+	set[id] = struct{}{}
+}
+
+func (m *manager) LeaveRoom(id, room string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if set, ok := m.rooms[room]; ok {
+		delete(set, id)
+		if len(set) == 0 {
+			delete(m.rooms, room)
+		}
+	}
+}
+
+func (m *manager) SendTo(id string, mt int, msg []byte) error {
+	m.mu.RLock()
+	c, ok := m.conns[id]
+	m.mu.RUnlock()
+	if !ok {
+		return apperr.New().WithHTTPStatus(http.StatusNotFound).WithCode("NOT_CONNECTED").WithMessage("player not online")
+	}
+	return c.WriteMessage(mt, msg)
+}
+
+func (m *manager) SendToRoom(room string, mt int, msg []byte) {
+	m.mu.RLock()
+	set, ok := m.rooms[room]
+	if !ok {
+		m.mu.RUnlock()
+		return
+	}
+	ids := make([]string, 0, len(set))
+	for id := range set {
+		ids = append(ids, id)
+	}
+	m.mu.RUnlock()
+
+	for _, id := range ids {
+		_ = m.SendTo(id, mt, msg)
+	}
+}
+
+func (m *manager) Broadcast(mt int, msg []byte) {
+	m.mu.RLock()
+	ids := make([]string, 0, len(m.conns))
+	for id := range m.conns {
+		ids = append(ids, id)
+	}
+	m.mu.RUnlock()
+
+	for _, id := range ids {
+		_ = m.SendTo(id, mt, msg)
+	}
+}
+
+func (m *manager) Refresh(_ context.Context, _ string) {}
+
+/*──────────────────────────────
+   HANDLER
+──────────────────────────────*/
+
+type Middleware func(next http.HandlerFunc) http.HandlerFunc
+type HandlerFunc func(ctx context.Context, conn *SafeConn)
+
 type errorPayload struct {
 	Code    string      `json:"code"`
 	Message string      `json:"message"`
 	Context interface{} `json:"context,omitempty"`
 }
 
-// Manager knows how to register/unregister connections and refresh sessions.
-type Manager interface {
-	Register(ctx context.Context, id string, conn *websocket.Conn) error
-	Unregister(ctx context.Context, id string) error
-	SendTo(id string, mt int, msg []byte) error
-	Broadcast(mt int, msg []byte)
-	Refresh(ctx context.Context, id string)
-}
-
-// HeartbeatPublisher defines how to publish a heartbeat event (e.g., to NATS).
-type HeartbeatPublisher interface {
-	PublishHeartbeat(ctx context.Context, id string) error
-}
-
-// Middleware wraps an http.HandlerFunc.
-type Middleware func(next http.HandlerFunc) http.HandlerFunc
-
-// HandlerFunc is invoked once the WebSocket is established.
-type HandlerFunc func(ctx context.Context, conn *websocket.Conn)
-
-// Handler is the generic WebSocket HTTP handler.
 type Handler struct {
-	upgrader           websocket.Upgrader
+	upgrader           httpws.Upgrader
 	manager            Manager
 	middlewares        []Middleware
 	handle             HandlerFunc
 	logger             *logging.Logger
 	heartbeatPublisher HeartbeatPublisher
-
-	// heartbeat timeouts
-	pongWait   time.Duration
-	pingPeriod time.Duration
+	pongWait           time.Duration
+	pingPeriod         time.Duration
+	allowedOrigins     []string
 }
 
-// Option customizes a Handler.
+type HeartbeatPublisher interface {
+	PublishHeartbeat(ctx context.Context, id string) error
+}
+
 type Option func(*Handler)
 
-// WithUpgrader overrides the default upgrader.
-func WithUpgrader(u websocket.Upgrader) Option {
-	return func(h *Handler) { h.upgrader = u }
+func WithUpgrader(u httpws.Upgrader) Option { return func(h *Handler) { h.upgrader = u } }
+func WithHandlerFunc(fn HandlerFunc) Option { return func(h *Handler) { h.handle = fn } }
+func WithLogger(l *logging.Logger) Option   { return func(h *Handler) { h.logger = l } }
+func WithPingPong(pw, pp time.Duration) Option {
+	return func(h *Handler) { h.pongWait, h.pingPeriod = pw, pp }
 }
-
-// WithHandlerFunc sets the core message loop.
-func WithHandlerFunc(fn HandlerFunc) Option {
-	return func(h *Handler) { h.handle = fn }
-}
-
-// WithLogger injects a go-toolkit Logger for internal logs.
-func WithLogger(log *logging.Logger) Option {
-	return func(h *Handler) { h.logger = log }
-}
-
-// WithPingPong overrides the default ping/pong timings.
-func WithPingPong(pongWait, pingPeriod time.Duration) Option {
-	return func(h *Handler) {
-		h.pongWait = pongWait
-		h.pingPeriod = pingPeriod
-	}
-}
-
-// WithHeartbeatPublisher sets a HeartbeatPublisher to emit heartbeat events.
 func WithHeartbeatPublisher(p HeartbeatPublisher) Option {
 	return func(h *Handler) { h.heartbeatPublisher = p }
 }
+func WithAllowedOrigins(origins ...string) Option {
+	return func(h *Handler) { h.allowedOrigins = origins }
+}
 
-// Default timing for ping/pong to keep session alive.
 const (
 	defaultPongWait   = 60 * time.Second
 	defaultPingPeriod = (defaultPongWait * 9) / 10
 )
 
-// NewHandler builds a Handler with defaults (echo loop, permissive upgrader).
 func NewHandler(m Manager, opts ...Option) *Handler {
 	logger, err := logging.New()
 	if err != nil {
-		panic("failed to create logger: " + err.Error())
+		panic("logger init failed: " + err.Error())
 	}
-
 	h := &Handler{
-		upgrader: websocket.Upgrader{
-			CheckOrigin: func(r *http.Request) bool { return true },
+		upgrader: httpws.Upgrader{
+			ReadBufferSize:    4096,
+			WriteBufferSize:   4096,
+			EnableCompression: false,
 		},
 		manager:    m,
 		handle:     defaultEcho,
@@ -111,98 +224,88 @@ func NewHandler(m Manager, opts ...Option) *Handler {
 	for _, o := range opts {
 		o(h)
 	}
+	h.upgrader.CheckOrigin = func(r *http.Request) bool {
+		origin := r.Header.Get("Origin")
+		if len(h.allowedOrigins) > 0 {
+			for _, a := range h.allowedOrigins {
+				if a == origin {
+					return true
+				}
+			}
+			return false
+		}
+		if origin == "" {
+			return true
+		}
+		u, err := url.Parse(origin)
+		if err != nil {
+			return false
+		}
+		return u.Host == r.Host
+	}
 	return h
 }
 
-// defaultEcho is the default HandlerFunc: echo back messages.
-func defaultEcho(ctx context.Context, conn *websocket.Conn) {
+func defaultEcho(ctx context.Context, conn *SafeConn) {
 	for {
 		mt, msg, err := conn.ReadMessage()
 		if err != nil {
 			return
 		}
-		if err := conn.WriteMessage(mt, msg); err != nil {
-			return
-		}
+		_ = conn.WriteMessage(mt, msg)
 	}
 }
 
-// Use appends a Middleware.
-func (h *Handler) Use(mw Middleware) {
-	h.middlewares = append(h.middlewares, mw)
-}
+func (h *Handler) Use(mw Middleware) { h.middlewares = append(h.middlewares, mw) }
 
-// closeConnection envia o frame de Close e fecha a conexão
-func (h *Handler) closeConnection(conn *websocket.Conn, code int, text string) {
-	// tenta enviar um CloseFrame com timeout de 5s
-	if err := conn.WriteControl(
-		websocket.CloseMessage,
-		websocket.FormatCloseMessage(code, text),
-		time.Now().Add(5*time.Second),
-	); err != nil {
-		h.logger.Warn("failed to send close frame", zap.Error(err))
-	}
-	conn.Close()
-}
-
-// ServeHTTP implementa http.Handler com heartbeat "server-pull" e clean close
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	final := func(w http.ResponseWriter, r *http.Request) {
-		ctx, cancel := context.WithCancel(r.Context())
-		defer cancel()
+		ctx := r.Context()
+		tid, _ := ctx.Value(contexts.KeyTenantID).(string)
+		pid, _ := ctx.Value(contexts.KeyPlayerID).(string)
 
-		id, _ := ctx.Value(contexts.KeyPlayerID).(string)
-
-		conn, err := h.upgrader.Upgrade(w, r, nil)
+		rawConn, err := h.upgrader.Upgrade(w, r, nil)
 		if err != nil {
-			h.handleError(ctx, w, r, err)
+			h.handleError(ctx, w, err)
 			return
 		}
-		// clean close via helper
-		defer h.closeConnection(conn, websocket.CloseNormalClosure, "server shutdown")
+		defer rawConn.Close()
 
-		h.logger.InfoCtx(ctx, "WebSocket handshake", zap.String("playerID", id))
+		conn := &SafeConn{Conn: rawConn}
+		conn.SetReadLimit(1 << 20)
+		conn.SetReadDeadline(time.Now().UTC().Add(h.pongWait))
+		conn.SetPongHandler(func(string) error {
+			conn.SetReadDeadline(time.Now().UTC().Add(h.pongWait))
+			h.manager.Refresh(ctx, pid)
+			if h.heartbeatPublisher != nil {
+				_ = h.heartbeatPublisher.PublishHeartbeat(ctx, pid)
+			}
+			return nil
+		})
 
-		if err := h.manager.Register(ctx, id, conn); err != nil {
-			h.handleError(ctx, w, r, err)
+		if err := h.manager.Register(ctx, pid, rawConn); err != nil {
+			h.handleError(ctx, w, err)
 			return
 		}
-		defer h.manager.Unregister(ctx, id)
+		defer h.manager.Unregister(ctx, pid)
 
-		// HEARTBEAT "SERVER-PULL"
 		ticker := time.NewTicker(h.pingPeriod)
 		defer ticker.Stop()
-
+		done := make(chan struct{})
 		go func() {
 			for {
 				select {
 				case <-ticker.C:
-					// ping de controle; falha = desconexão
-					if err := conn.WriteControl(
-						websocket.PingMessage,
-						nil,
-						time.Now().Add(5*time.Second),
-					); err != nil {
-						cancel()
-						return
-					}
-					h.manager.Refresh(ctx, id)
-
-					if h.heartbeatPublisher != nil {
-						go func() {
-							if err := h.heartbeatPublisher.PublishHeartbeat(ctx, id); err != nil {
-								h.logger.WarnCtx(ctx, "heartbeat publish failed", zap.Error(err))
-							}
-						}()
-					}
-
-				case <-ctx.Done():
+					_ = conn.WriteControl(httpws.PingMessage, nil, time.Now().UTC().Add(5*time.Second))
+				case <-done:
 					return
 				}
 			}
 		}()
 
+		h.logger.InfoCtx(ctx, "ws connected", zap.String("tenant", tid), zap.String("player", pid))
 		h.handle(ctx, conn)
+		close(done)
 	}
 
 	handler := final
@@ -212,20 +315,18 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	handler(w, r)
 }
 
-// handleError standardizes error responses using go-toolkit/errors.AppError.
-func (h *Handler) handleError(ctx context.Context, w http.ResponseWriter, _ *http.Request, err error) {
-	var (
-		payload errorPayload
-		status  int
-	)
+func (h *Handler) handleError(ctx context.Context, w http.ResponseWriter, err error) {
+	var payload errorPayload
+	var status int
+
 	if ae, ok := apperr.FromError(err); ok {
 		payload = errorPayload{Code: ae.ErrCode(), Message: ae.Message, Context: ae.Context}
 		status = ae.Status()
-		h.logger.WarnCtx(ctx, "WebSocket app error", zap.String("code", payload.Code), zap.Error(err))
+		h.logger.WarnCtx(ctx, "ws app error", zap.String("code", payload.Code), zap.Error(err))
 	} else {
 		payload = errorPayload{Code: "INTERNAL_ERROR", Message: "internal server error"}
 		status = http.StatusInternalServerError
-		h.logger.ErrorCtx(ctx, "WebSocket internal error", zap.Error(err))
+		h.logger.ErrorCtx(ctx, "ws internal error", zap.Error(err))
 	}
 
 	w.Header().Set("Content-Type", "application/json")

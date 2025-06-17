@@ -134,3 +134,37 @@ func ParseOptionalUUID(s string) (*uuid.UUID, error) {
 	}
 	return &u, nil
 }
+
+func GetTenantID(c fiber.Ctx) (uuid.UUID, error) {
+	raw := c.Locals("tenantID")
+	if raw == nil {
+		return uuid.Nil, apperr.New().
+			WithHTTPStatus(http.StatusBadRequest).
+			WithCode("TENANT_ID_MISSING").
+			WithMessage("tenantID not found")
+	}
+	str, ok := raw.(string)
+	if !ok || str == "" {
+		return uuid.Nil, apperr.New().
+			WithHTTPStatus(http.StatusBadRequest).
+			WithCode("TENANT_ID_INVALID").
+			WithMessage("invalid tenantID")
+	}
+	id, err := uuid.Parse(str)
+	if err != nil {
+		return uuid.Nil, apperr.New().
+			WithHTTPStatus(http.StatusBadRequest).
+			WithCode("TENANT_ID_INVALID").
+			WithMessage("invalid tenantID").
+			WithError(err)
+	}
+	return id, nil
+}
+
+func MustGetTenantID(c fiber.Ctx) uuid.UUID {
+	id, err := GetTenantID(c)
+	if err != nil {
+		panic(err)
+	}
+	return id
+}
