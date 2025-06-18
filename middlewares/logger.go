@@ -78,6 +78,10 @@ func (l *Logger) Handler() fiber.Handler {
 			fields = append(fields, zap.String("user_id", uid))
 		}
 
+		if used, ok := c.Locals("used_permissions").([]string); ok && len(used) > 0 {
+			fields = append(fields, zap.Strings("permissions", used))
+		}
+
 		if l.logQuery {
 			rawQS := string(c.Request().URI().QueryString())
 			safeQS := sanitizeQuery(rawQS, l.queryBlacklist)
@@ -93,11 +97,16 @@ func (l *Logger) Handler() fiber.Handler {
 
 		err := c.Next()
 
-		l.log.InfoCtx(ctx, "response sent",
+		// incluir permissões também na resposta, se desejar
+		respFields := []zap.Field{
 			zap.String("request_id", rid),
 			zap.Int("status", c.Response().StatusCode()),
 			zap.Duration("latency", time.Since(start)),
-		)
+		}
+		if used, ok := c.Locals("used_permissions").([]string); ok && len(used) > 0 {
+			respFields = append(respFields, zap.Strings("permissions", used))
+		}
+		l.log.InfoCtx(ctx, "response sent", respFields...)
 
 		if err != nil {
 			l.log.ErrorCtx(ctx, "request error",
