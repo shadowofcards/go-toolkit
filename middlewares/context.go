@@ -143,12 +143,10 @@ func (a *AuthMiddleware) authenticateJWT(ctx context.Context, c fiber.Ctx) error
 		}
 	}
 
-	// Extract claims safely
 	sub, _ := mClaims["sub"].(string)
 	tid, _ := mClaims["tid"].(string)
 	usern, _ := mClaims["preferred_username"].(string)
 
-	// Extract roles
 	var roles []string
 	if ra, ok := mClaims["realm_access"].(map[string]interface{}); ok {
 		if arr, ok := ra["roles"].([]interface{}); ok {
@@ -159,21 +157,14 @@ func (a *AuthMiddleware) authenticateJWT(ctx context.Context, c fiber.Ctx) error
 			}
 		}
 	}
-	if arr, ok := mClaims["perms"].([]interface{}); ok {
-		for _, p := range arr {
-			if s, ok := p.(string); ok {
-				roles = append(roles, s)
-			}
-		}
-	}
 
-	// Populate context and locals
 	ctx = context.WithValue(ctx, contexts.KeyTenantID, tid)
 	ctx = context.WithValue(ctx, contexts.KeyUserID, sub)
 	ctx = context.WithValue(ctx, contexts.KeyUsername, usern)
 	ctx = context.WithValue(ctx, contexts.KeyUserRoles, roles)
 	c.SetContext(ctx)
 
+	c.Locals("claims", mClaims)
 	c.Locals("tenantID", tid)
 	c.Locals("userID", sub)
 	c.Locals("username", usern)

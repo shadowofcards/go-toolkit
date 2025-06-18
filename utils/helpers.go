@@ -91,34 +91,8 @@ func BindQuery(c fiber.Ctx, v any) error {
 	return nil
 }
 
-func MustGetBody(c fiber.Ctx, v any) { _ = GetBody(c, v) }
-
+func MustGetBody(c fiber.Ctx, v any)   { _ = GetBody(c, v) }
 func MustBindQuery(c fiber.Ctx, v any) { _ = BindQuery(c, v) }
-
-func GetPlayerID(c fiber.Ctx) (uuid.UUID, error) {
-	raw := c.Locals("playerID")
-	if raw == nil {
-		return uuid.Nil, apperr.New().
-			WithHTTPStatus(http.StatusUnauthorized).
-			WithCode("PLAYER_ID_MISSING").
-			WithMessage("playerID not found")
-	}
-	str, ok := raw.(string)
-	if !ok || str == "" {
-		return uuid.Nil, apperr.New().
-			WithHTTPStatus(http.StatusUnauthorized).
-			WithCode("PLAYER_ID_INVALID").
-			WithMessage("invalid playerID")
-	}
-	id, err := uuid.Parse(str)
-	if err != nil {
-		return uuid.Nil, apperr.New().
-			WithHTTPStatus(http.StatusUnauthorized).
-			WithCode("PLAYER_ID_INVALID").
-			WithMessage("invalid playerID")
-	}
-	return id, nil
-}
 
 func ParseOptionalUUID(s string) (*uuid.UUID, error) {
 	if s == "" {
@@ -167,4 +141,46 @@ func MustGetTenantID(c fiber.Ctx) uuid.UUID {
 		panic(err)
 	}
 	return id
+}
+
+func GetUserID(c fiber.Ctx) (uuid.UUID, error) {
+	raw := c.Locals("userID")
+	if raw == nil {
+		return uuid.Nil, apperr.New().
+			WithHTTPStatus(http.StatusUnauthorized).
+			WithCode("USER_ID_MISSING").
+			WithMessage("userID not found")
+	}
+	str, ok := raw.(string)
+	if !ok || str == "" {
+		return uuid.Nil, apperr.New().
+			WithHTTPStatus(http.StatusUnauthorized).
+			WithCode("USER_ID_INVALID").
+			WithMessage("invalid userID")
+	}
+	id, err := uuid.Parse(str)
+	if err != nil {
+		return uuid.Nil, apperr.New().
+			WithHTTPStatus(http.StatusUnauthorized).
+			WithCode("USER_ID_INVALID").
+			WithMessage("invalid userID").
+			WithError(err)
+	}
+	return id, nil
+}
+
+func MustGetUserID(c fiber.Ctx) uuid.UUID {
+	id, err := GetUserID(c)
+	if err != nil {
+		panic(err)
+	}
+	return id
+}
+
+func GetRoles(c fiber.Ctx) []string {
+	raw := c.Locals("roles")
+	if arr, ok := raw.([]string); ok {
+		return arr
+	}
+	return nil
 }
