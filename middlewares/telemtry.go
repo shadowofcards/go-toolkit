@@ -1,7 +1,9 @@
 package middlewares
 
 import (
+	"fmt"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/gofiber/fiber/v3"
@@ -29,6 +31,8 @@ func WithHTTPMetrics(rec metrics.Recorder) fiber.Handler {
 		start := time.Now()
 		ctx := c.Context()
 
+		method := string(c.Method())
+
 		_ = rec.Gauge(ctx, "http_in_flight_requests", 1)
 		_ = rec.Gauge(ctx, "http_request_size_bytes", float64(len(c.Body())))
 
@@ -41,14 +45,16 @@ func WithHTTPMetrics(rec metrics.Recorder) fiber.Handler {
 		if routePath == "" {
 			routePath = c.OriginalURL()
 		}
-
 		normalizedPath := normalizePath(routePath)
 
 		_ = rec.Gauge(ctx, "http_in_flight_requests", -1)
 		_ = rec.Inc(ctx, "http_requests_total", 1)
-		_ = rec.Gauge(ctx, "http_request_duration_seconds", duration)
-		_ = rec.Gauge(ctx, "http_response_size_bytes", float64(len(c.Response().Body())))
+		_ = rec.Inc(ctx, "http_requests_by_method_"+method, 1)
+		_ = rec.Inc(ctx, "http_requests_by_status_"+statusCodeKey(status), 1)
 		_ = rec.Inc(ctx, "http_requests_by_path_"+normalizedPath, 1)
+		_ = rec.Gauge(ctx, "http_request_duration_seconds", duration)
+		_ = rec.Gauge(ctx, "http_latency_by_path_"+normalizedPath, duration)
+		_ = rec.Gauge(ctx, "http_response_size_bytes", float64(len(c.Response().Body())))
 
 		statusClass := "<unknown>"
 		switch {
@@ -56,18 +62,25 @@ func WithHTTPMetrics(rec metrics.Recorder) fiber.Handler {
 			statusClass = "1xx"
 		case status >= 200 && status < 300:
 			statusClass = "2xx"
+			_ = rec.Inc(ctx, "http_success_total", 1)
 		case status >= 300 && status < 400:
 			statusClass = "3xx"
 		case status >= 400 && status < 500:
 			statusClass = "4xx"
 			_ = rec.Inc(ctx, "http_client_errors_total", 1)
+			_ = rec.Inc(ctx, "http_errors_total", 1)
 		case status >= 500:
 			statusClass = "5xx"
 			_ = rec.Inc(ctx, "http_server_errors_total", 1)
+			_ = rec.Inc(ctx, "http_errors_total", 1)
 		}
 
 		_ = rec.Inc(ctx, "http_response_status_class_"+statusClass, 1)
 
 		return err
 	}
+}
+
+func statusCodeKey(code int) string {
+	return strings.ReplaceAll(fmt.Sprintf("%03d", code), ".", "_")
 }
