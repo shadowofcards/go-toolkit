@@ -93,32 +93,44 @@ type noopRecorder struct{}
 
 func (noopRecorder) Inc(context.Context, string, int64) error     { return nil }
 func (noopRecorder) Gauge(context.Context, string, float64) error { return nil }
+func (noopRecorder) IncWithTags(context.Context, string, int64, map[string]string) error {
+	return nil
+}
+func (noopRecorder) GaugeWithTags(context.Context, string, float64, map[string]string) error {
+	return nil
+}
 
 func (m *manager) Register(ctx context.Context, id string, raw *httpws.Conn) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
 	if _, ok := m.conns[id]; ok {
-		m.metrics.Inc(ctx, "errors_total", 1)
+		m.metrics.IncWithTags(ctx, "errors_total", 1, map[string]string{"player_id": id, "stage": "register"})
 		return apperr.New().
 			WithHTTPStatus(http.StatusConflict).
 			WithCode("ALREADY_CONNECTED").
 			WithMessage("connection exists")
 	}
+
 	m.conns[id] = &SafeConn{Conn: raw}
 	m.ctxs[id] = ctx
-	m.metrics.Gauge(ctx, "active_rooms", float64(len(m.conns)))
+
+	m.metrics.GaugeWithTags(ctx, "connections_active", float64(len(m.conns)), map[string]string{"player_id": id})
 	return nil
 }
 
 func (m *manager) Unregister(ctx context.Context, id string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
 	if c, ok := m.conns[id]; ok {
 		_ = c.Close()
 		delete(m.conns, id)
 	}
 	delete(m.ctxs, id)
-	m.metrics.Gauge(ctx, "active_rooms", float64(len(m.conns)))
+
+	m.metrics.GaugeWithTags(ctx, "connections_active", float64(len(m.conns)), map[string]string{"player_id": id})
+
 	for room, set := range m.rooms {
 		delete(set, id)
 		if len(set) == 0 {
@@ -130,28 +142,30 @@ func (m *manager) Unregister(ctx context.Context, id string) {
 func (m *manager) JoinRoom(id, room string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	set, ok := m.rooms[room]
-	if !ok {
-		set = make(map[string]struct{})
-		m.rooms[room] = set
+
+	if _, ok := m.rooms[room]; !ok {
+		m.rooms[room] = make(map[string]struct{})
 	}
-	set[id] = struct{}{}
+	m.rooms[room][id] = struct{}{}
+
 	if ctx, ok := m.ctxs[id]; ok {
-		m.metrics.Inc(ctx, "room_joins_total", 1)
+		m.metrics.IncWithTags(ctx, "room_joins_total", 1, map[string]string{"room": room, "player_id": id})
 	}
 }
 
 func (m *manager) LeaveRoom(id, room string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
 	if set, ok := m.rooms[room]; ok {
 		delete(set, id)
 		if len(set) == 0 {
 			delete(m.rooms, room)
 		}
 	}
+
 	if ctx, ok := m.ctxs[id]; ok {
-		m.metrics.Inc(ctx, "room_leaves_total", 1)
+		m.metrics.IncWithTags(ctx, "room_leaves_total", 1, map[string]string{"room": room, "player_id": id})
 	}
 }
 
@@ -160,16 +174,18 @@ func (m *manager) SendTo(id string, mt int, msg []byte) error {
 	c, ok := m.conns[id]
 	ctx := m.ctxs[id]
 	m.mu.RUnlock()
+
 	if !ok {
-		m.metrics.Inc(ctx, "errors_total", 1)
+		m.metrics.IncWithTags(ctx, "errors_total", 1, map[string]string{"stage": "send_to", "player_id": id})
 		return apperr.New().
 			WithHTTPStatus(http.StatusNotFound).
 			WithCode("NOT_CONNECTED").
 			WithMessage("player not online")
 	}
+
 	err := c.WriteMessage(mt, msg)
 	if err != nil {
-		m.metrics.Inc(ctx, "errors_total", 1)
+		m.metrics.IncWithTags(ctx, "errors_total", 1, map[string]string{"stage": "write", "player_id": id})
 	}
 	return err
 }
@@ -181,17 +197,21 @@ func (m *manager) SendToRoom(room string, mt int, msg []byte) {
 	if !ok {
 		return
 	}
-	ids := make([]string, 0, len(set))
+
 	m.mu.RLock()
+	ids := make([]string, 0, len(set))
 	for id := range set {
 		ids = append(ids, id)
 	}
 	m.mu.RUnlock()
+
 	var ctx context.Context
 	if len(ids) > 0 {
 		ctx = m.ctxs[ids[0]]
 	}
-	m.metrics.Inc(ctx, "broadcasts_total", 1)
+
+	m.metrics.IncWithTags(ctx, "broadcasts_total", 1, map[string]string{"room": room, "type": "room"})
+
 	for _, id := range ids {
 		_ = m.SendTo(id, mt, msg)
 	}
@@ -204,11 +224,14 @@ func (m *manager) Broadcast(mt int, msg []byte) {
 		ids = append(ids, id)
 	}
 	m.mu.RUnlock()
+
 	var ctx context.Context
 	if len(ids) > 0 {
 		ctx = m.ctxs[ids[0]]
 	}
-	m.metrics.Inc(ctx, "broadcasts_total", 1)
+
+	m.metrics.IncWithTags(ctx, "broadcasts_total", 1, map[string]string{"type": "global"})
+
 	for _, id := range ids {
 		_ = m.SendTo(id, mt, msg)
 	}

@@ -1,7 +1,7 @@
 package middlewares
 
 import (
-	"fmt"
+	"net/http"
 	"regexp"
 	"strings"
 	"time"
@@ -32,55 +32,74 @@ func WithHTTPMetrics(rec metrics.Recorder) fiber.Handler {
 		ctx := c.Context()
 
 		method := string(c.Method())
-
-		_ = rec.Gauge(ctx, "http_in_flight_requests", 1)
-		_ = rec.Gauge(ctx, "http_request_size_bytes", float64(len(c.Body())))
-
-		err := c.Next()
-
-		duration := time.Since(start).Seconds()
-		status := c.Response().StatusCode()
-
 		routePath := c.Route().Path
 		if routePath == "" {
 			routePath = c.OriginalURL()
 		}
 		normalizedPath := normalizePath(routePath)
+		caller := c.Get("X-Caller-ID", "external")
 
-		_ = rec.Gauge(ctx, "http_in_flight_requests", -1)
-		_ = rec.Inc(ctx, "http_requests_total", 1)
-		_ = rec.Inc(ctx, "http_requests_by_method_"+method, 1)
-		_ = rec.Inc(ctx, "http_requests_by_status_"+statusCodeKey(status), 1)
-		_ = rec.Inc(ctx, "http_requests_by_path_"+normalizedPath, 1)
-		_ = rec.Gauge(ctx, "http_request_duration_seconds", duration)
-		_ = rec.Gauge(ctx, "http_latency_by_path_"+normalizedPath, duration)
-		_ = rec.Gauge(ctx, "http_response_size_bytes", float64(len(c.Response().Body())))
+		baseTags := map[string]string{
+			"path":   normalizedPath,
+			"method": method,
+			"caller": caller,
+		}
 
-		statusClass := "<unknown>"
+		_ = rec.GaugeWithTags(ctx, "http_in_flight_requests", 1, baseTags)
+		_ = rec.GaugeWithTags(ctx, "http_request_size_bytes", float64(len(c.Body())), baseTags)
+
+		err := c.Next()
+
+		duration := time.Since(start).Seconds()
+		status := c.Response().StatusCode()
+		statusStr := statusCodeKey(status)
+
+		tags := cloneTags(baseTags)
+		tags["status"] = statusStr
+
+		_ = rec.GaugeWithTags(ctx, "http_in_flight_requests", -1, tags)
+		_ = rec.IncWithTags(ctx, "http_requests_total", 1, tags)
+		_ = rec.GaugeWithTags(ctx, "http_request_duration_seconds", duration, tags)
+		_ = rec.GaugeWithTags(ctx, "http_response_size_bytes", float64(len(c.Response().Body())), tags)
+		_ = rec.GaugeWithTags(ctx, "http_latency_by_path", duration, tags)
+
+		statusClass := "unknown"
 		switch {
 		case status >= 100 && status < 200:
 			statusClass = "1xx"
 		case status >= 200 && status < 300:
 			statusClass = "2xx"
-			_ = rec.Inc(ctx, "http_success_total", 1)
+			_ = rec.IncWithTags(ctx, "http_success_total", 1, tags)
 		case status >= 300 && status < 400:
 			statusClass = "3xx"
 		case status >= 400 && status < 500:
 			statusClass = "4xx"
-			_ = rec.Inc(ctx, "http_client_errors_total", 1)
-			_ = rec.Inc(ctx, "http_errors_total", 1)
+			_ = rec.IncWithTags(ctx, "http_client_errors_total", 1, tags)
+			_ = rec.IncWithTags(ctx, "http_errors_total", 1, tags)
 		case status >= 500:
 			statusClass = "5xx"
-			_ = rec.Inc(ctx, "http_server_errors_total", 1)
-			_ = rec.Inc(ctx, "http_errors_total", 1)
+			_ = rec.IncWithTags(ctx, "http_server_errors_total", 1, tags)
+			_ = rec.IncWithTags(ctx, "http_errors_total", 1, tags)
 		}
 
-		_ = rec.Inc(ctx, "http_response_status_class_"+statusClass, 1)
+		tags["status_class"] = statusClass
+		_ = rec.IncWithTags(ctx, "http_response_status_class_total", 1, tags)
 
 		return err
 	}
 }
 
 func statusCodeKey(code int) string {
-	return strings.ReplaceAll(fmt.Sprintf("%03d", code), ".", "_")
+	if code < 100 {
+		return "UNKNOWN"
+	}
+	return strings.ReplaceAll(strings.ToUpper(http.StatusText(code)), " ", "_")
+}
+
+func cloneTags(original map[string]string) map[string]string {
+	cloned := make(map[string]string, len(original))
+	for k, v := range original {
+		cloned[k] = v
+	}
+	return cloned
 }

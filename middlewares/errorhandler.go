@@ -22,11 +22,28 @@ func NewErrorHandler(rec metrics.Recorder) fiber.ErrorHandler {
 	return func(c fiber.Ctx, err error) error {
 		ctx := c.Context()
 
+		caller := c.Get("X-Caller-ID", "external")
+		method := string(c.Method())
+		path := c.Route().Path
+		if path == "" {
+			path = c.OriginalURL()
+		}
+
+		baseTags := map[string]string{
+			"method": method,
+			"path":   path,
+			"caller": caller,
+		}
+
+		// Validação com validator.v10
 		var ve validator.ValidationErrors
 		if errors.As(err, &ve) {
 			code := "VALIDATION_ERROR"
-			_ = rec.Inc(ctx, "http_error_handler_code_"+code, 1)
-			_ = rec.Inc(ctx, "http_error_handler_type_"+code, 1)
+			tags := cloneTags(baseTags)
+			tags["code"] = code
+			tags["type"] = "validation"
+
+			_ = rec.IncWithTags(ctx, "http_errors_total", 1, tags)
 
 			context := make(map[string]string, len(ve))
 			for _, f := range ve {
@@ -39,6 +56,7 @@ func NewErrorHandler(rec metrics.Recorder) fiber.ErrorHandler {
 			})
 		}
 
+		// AppError customizado
 		if ae, ok := apperr.FromError(err); ok {
 			code := ae.ErrCode()
 			typeName := "<nil>"
@@ -46,8 +64,11 @@ func NewErrorHandler(rec metrics.Recorder) fiber.ErrorHandler {
 				typeName = fmt.Sprintf("%T", ae.Err)
 			}
 
-			_ = rec.Inc(ctx, "http_error_handler_code_"+code, 1)
-			_ = rec.Inc(ctx, "http_error_handler_type_"+typeName, 1)
+			tags := cloneTags(baseTags)
+			tags["code"] = code
+			tags["type"] = typeName
+
+			_ = rec.IncWithTags(ctx, "http_errors_total", 1, tags)
 
 			payload := errorPayload{
 				Code:    code,
@@ -59,11 +80,14 @@ func NewErrorHandler(rec metrics.Recorder) fiber.ErrorHandler {
 			return respond(c, ae.Status(), payload)
 		}
 
+		// Erro do Fiber
 		if fe, ok := err.(*fiber.Error); ok {
 			code := strings.ReplaceAll(strings.ToUpper(http.StatusText(fe.Code)), " ", "_")
+			tags := cloneTags(baseTags)
+			tags["code"] = code
+			tags["type"] = "*fiber.Error"
 
-			_ = rec.Inc(ctx, "http_error_handler_code_"+code, 1)
-			_ = rec.Inc(ctx, "http_error_handler_type_*fiber.Error", 1)
+			_ = rec.IncWithTags(ctx, "http_errors_total", 1, tags)
 
 			return respond(c, fe.Code, errorPayload{
 				Code:    code,
@@ -71,9 +95,13 @@ func NewErrorHandler(rec metrics.Recorder) fiber.ErrorHandler {
 			})
 		}
 
+		// Erro desconhecido
 		code := "INTERNAL_ERROR"
-		_ = rec.Inc(ctx, "http_error_handler_code_"+code, 1)
-		_ = rec.Inc(ctx, "http_error_handler_type_unknown", 1)
+		tags := cloneTags(baseTags)
+		tags["code"] = code
+		tags["type"] = "unknown"
+
+		_ = rec.IncWithTags(ctx, "http_errors_total", 1, tags)
 
 		return respond(c, http.StatusInternalServerError, errorPayload{
 			Code:    code,
