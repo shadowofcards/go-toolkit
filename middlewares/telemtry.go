@@ -32,10 +32,12 @@ func WithHTTPMetrics(rec metrics.Recorder) fiber.Handler {
 		ctx := c.Context()
 
 		method := string(c.Method())
+
 		routePath := c.Route().Path
-		if routePath == "" {
-			routePath = c.OriginalURL()
+		if routePath == "" || routePath == "/" {
+			routePath = c.Path()
 		}
+
 		normalizedPath := normalizePath(routePath)
 		caller := c.Get("X-Caller-ID", "external")
 
