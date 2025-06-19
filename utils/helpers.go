@@ -184,3 +184,22 @@ func GetRoles(c fiber.Ctx) []string {
 	}
 	return nil
 }
+
+func GetUUIDParam(c fiber.Ctx, name string) (uuid.UUID, error) {
+	val := c.Params(name)
+	if val == "" {
+		return uuid.Nil, apperr.New().
+			WithHTTPStatus(http.StatusBadRequest).
+			WithCode("MISSING_PARAM").
+			WithMessage("missing :" + name + " path param")
+	}
+	id, err := uuid.Parse(val)
+	if err != nil {
+		return uuid.Nil, apperr.New().
+			WithHTTPStatus(http.StatusBadRequest).
+			WithCode("INVALID_PARAM").
+			WithMessage("invalid uuid for param: " + name).
+			WithError(err)
+	}
+	return id, nil
+}
