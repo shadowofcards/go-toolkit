@@ -2,7 +2,6 @@ package middlewares
 
 import (
 	"regexp"
-	"strings"
 	"time"
 
 	"github.com/gofiber/fiber/v3"
@@ -10,21 +9,22 @@ import (
 )
 
 var (
-	uuidPattern = regexp.MustCompile(`[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}`)
-	numericID   = regexp.MustCompile(`\b\d{4,}\b`)
+	uuidPattern  = regexp.MustCompile(`[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}`)
+	numericID    = regexp.MustCompile(`\b\d{4,}\b`)
+	leadingSlash = regexp.MustCompile(`^/+`)
 )
 
-func normalizePath(path, base string) string {
-	path = strings.TrimPrefix(path, base)
+func normalizePath(path string) string {
 	path = uuidPattern.ReplaceAllString(path, "<uuid>")
 	path = numericID.ReplaceAllString(path, "<id>")
+	path = leadingSlash.ReplaceAllString(path, "/")
 	if path == "" {
 		return "/"
 	}
 	return path
 }
 
-func WithHTTPMetrics(rec metrics.Recorder, basePath string) fiber.Handler {
+func WithHTTPMetrics(rec metrics.Recorder) fiber.Handler {
 	return func(c fiber.Ctx) error {
 		start := time.Now()
 		ctx := c.Context()
@@ -37,16 +37,18 @@ func WithHTTPMetrics(rec metrics.Recorder, basePath string) fiber.Handler {
 		duration := time.Since(start).Seconds()
 		status := c.Response().StatusCode()
 
-		path := c.Route().Path
-		if path == "" {
-			path = normalizePath(c.Path(), basePath)
+		routePath := c.Route().Path
+		if routePath == "" {
+			routePath = c.OriginalURL()
 		}
+
+		normalizedPath := normalizePath(routePath)
 
 		_ = rec.Gauge(ctx, "http_in_flight_requests", -1)
 		_ = rec.Inc(ctx, "http_requests_total", 1)
 		_ = rec.Gauge(ctx, "http_request_duration_seconds", duration)
 		_ = rec.Gauge(ctx, "http_response_size_bytes", float64(len(c.Response().Body())))
-		_ = rec.Inc(ctx, "http_requests_by_path_"+path, 1)
+		_ = rec.Inc(ctx, "http_requests_by_path_"+normalizedPath, 1)
 
 		statusClass := "<unknown>"
 		switch {
