@@ -15,6 +15,9 @@ type Recorder interface {
 
 	IncWithTags(ctx context.Context, name string, delta int64, tags map[string]string) error
 	GaugeWithTags(ctx context.Context, name string, value float64, tags map[string]string) error
+
+	Observe(ctx context.Context, name string, value float64) error
+	ObserveWithTags(ctx context.Context, name string, value float64, tags map[string]string) error
 }
 
 type Factory interface {
@@ -89,6 +92,14 @@ func (c *Client) IncWithTags(ctx context.Context, name string, delta int64, extr
 }
 
 func (c *Client) GaugeWithTags(ctx context.Context, name string, value float64, extra map[string]string) error {
+	return c.write(ctx, name, map[string]interface{}{"value": value}, extra)
+}
+
+func (c *Client) Observe(ctx context.Context, name string, value float64) error {
+	return c.write(ctx, name, map[string]interface{}{"value": value}, nil)
+}
+
+func (c *Client) ObserveWithTags(ctx context.Context, name string, value float64, extra map[string]string) error {
 	return c.write(ctx, name, map[string]interface{}{"value": value}, extra)
 }
 

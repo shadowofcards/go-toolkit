@@ -13,6 +13,7 @@ import (
 	"github.com/shadowofcards/go-toolkit/contexts"
 	"github.com/shadowofcards/go-toolkit/errors"
 	"github.com/shadowofcards/go-toolkit/logging"
+	"github.com/shadowofcards/go-toolkit/metrics"
 	"go.uber.org/zap"
 )
 
@@ -27,6 +28,7 @@ type (
 		authToken  string
 		appName    string
 		log        *logging.Logger
+		metrics    metrics.Recorder
 	}
 
 	Option func(*BaseClient)
@@ -54,9 +56,10 @@ func WithTimeout(t time.Duration) Option {
 	}
 }
 
-func WithAuthToken(tk string) Option      { return func(c *BaseClient) { c.authToken = tk } }
-func WithAppName(n string) Option         { return func(c *BaseClient) { c.appName = n } }
-func WithLogger(l *logging.Logger) Option { return func(c *BaseClient) { c.log = l } }
+func WithAuthToken(tk string) Option        { return func(c *BaseClient) { c.authToken = tk } }
+func WithAppName(n string) Option           { return func(c *BaseClient) { c.appName = n } }
+func WithLogger(l *logging.Logger) Option   { return func(c *BaseClient) { c.log = l } }
+func WithMetrics(m metrics.Recorder) Option { return func(c *BaseClient) { c.metrics = m } }
 
 /* -------------------------------------------------------------------------- */
 /*                               Constructor                                  */
@@ -94,7 +97,6 @@ type apiErrPayload struct {
 /* -------------------------------------------------------------------------- */
 
 func (c *BaseClient) Do(ctx context.Context, method, path string, body io.Reader, v any) error {
-
 	if c.httpClient == nil {
 		if c.log != nil {
 			c.log.ErrorCtx(ctx, "nil httpClient detected")
@@ -114,6 +116,11 @@ func (c *BaseClient) Do(ctx context.Context, method, path string, body io.Reader
 			WithMessage("request canceled before start").
 			WithContext("url", fullURL)
 	default:
+	}
+
+	var start time.Time
+	if c.metrics != nil {
+		start = time.Now()
 	}
 
 	if c.log != nil {
@@ -173,6 +180,25 @@ func (c *BaseClient) Do(ctx context.Context, method, path string, body io.Reader
 	}
 
 	res, err := c.httpClient.Do(req)
+	if c.metrics != nil {
+		duration := float64(0)
+		if !start.IsZero() {
+			duration = time.Since(start).Seconds()
+		}
+		tags := map[string]string{
+			"method": strings.ToUpper(method),
+			"path":   path,
+			"host":   req.URL.Host,
+		}
+		status := 0
+		if res != nil {
+			status = res.StatusCode
+		}
+		tags["status"] = statusCodeKey(status)
+		c.metrics.IncWithTags(ctx, "http_client_requests_total", 1, tags)
+		c.metrics.ObserveWithTags(ctx, "http_client_request_duration_seconds", duration, tags)
+	}
+
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			code := "CTX_ERROR"
@@ -239,4 +265,11 @@ func (c *BaseClient) Do(ctx context.Context, method, path string, body io.Reader
 		c.log.InfoCtx(ctx, "HTTP request success", zap.Int("status", res.StatusCode))
 	}
 	return nil
+}
+
+func statusCodeKey(code int) string {
+	if code < 100 {
+		return "UNKNOWN"
+	}
+	return fmt.Sprintf("%d", code)
 }

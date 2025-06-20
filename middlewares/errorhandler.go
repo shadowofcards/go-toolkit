@@ -2,9 +2,7 @@ package middlewares
 
 import (
 	"errors"
-	"fmt"
 	"net/http"
-	"strings"
 
 	"github.com/go-playground/validator/v10"
 	"github.com/gofiber/fiber/v3"
@@ -29,20 +27,16 @@ func NewErrorHandler(rec metrics.Recorder) fiber.ErrorHandler {
 			path = c.OriginalURL()
 		}
 
-		baseTags := map[string]string{
+		tags := map[string]string{
 			"method": method,
 			"path":   path,
 			"caller": caller,
 		}
 
-		// Validação com validator.v10
 		var ve validator.ValidationErrors
 		if errors.As(err, &ve) {
-			code := "VALIDATION_ERROR"
-			tags := cloneTags(baseTags)
-			tags["code"] = code
+			tags["code"] = "VALIDATION_ERROR"
 			tags["type"] = "validation"
-
 			_ = rec.IncWithTags(ctx, "http_errors_total", 1, tags)
 
 			context := make(map[string]string, len(ve))
@@ -50,28 +44,19 @@ func NewErrorHandler(rec metrics.Recorder) fiber.ErrorHandler {
 				context[f.Field()] = "validation failed on '" + f.Tag() + "'"
 			}
 			return respond(c, http.StatusBadRequest, errorPayload{
-				Code:    code,
+				Code:    "VALIDATION_ERROR",
 				Message: "validation failed",
 				Context: context,
 			})
 		}
 
-		// AppError customizado
 		if ae, ok := apperr.FromError(err); ok {
-			code := ae.ErrCode()
-			typeName := "<nil>"
-			if ae.Err != nil {
-				typeName = fmt.Sprintf("%T", ae.Err)
-			}
-
-			tags := cloneTags(baseTags)
-			tags["code"] = code
-			tags["type"] = typeName
-
+			tags["code"] = ae.ErrCode()
+			tags["type"] = "app_error"
 			_ = rec.IncWithTags(ctx, "http_errors_total", 1, tags)
 
 			payload := errorPayload{
-				Code:    code,
+				Code:    ae.ErrCode(),
 				Message: ae.Message,
 			}
 			if len(ae.Context) > 0 {
@@ -80,31 +65,23 @@ func NewErrorHandler(rec metrics.Recorder) fiber.ErrorHandler {
 			return respond(c, ae.Status(), payload)
 		}
 
-		// Erro do Fiber
 		if fe, ok := err.(*fiber.Error); ok {
-			code := strings.ReplaceAll(strings.ToUpper(http.StatusText(fe.Code)), " ", "_")
-			tags := cloneTags(baseTags)
-			tags["code"] = code
-			tags["type"] = "*fiber.Error"
-
+			tags["code"] = statusCodeKey(fe.Code)
+			tags["type"] = "fiber_error"
 			_ = rec.IncWithTags(ctx, "http_errors_total", 1, tags)
 
 			return respond(c, fe.Code, errorPayload{
-				Code:    code,
+				Code:    tags["code"],
 				Message: fe.Message,
 			})
 		}
 
-		// Erro desconhecido
-		code := "INTERNAL_ERROR"
-		tags := cloneTags(baseTags)
-		tags["code"] = code
+		tags["code"] = "INTERNAL_ERROR"
 		tags["type"] = "unknown"
-
 		_ = rec.IncWithTags(ctx, "http_errors_total", 1, tags)
 
 		return respond(c, http.StatusInternalServerError, errorPayload{
-			Code:    code,
+			Code:    "INTERNAL_ERROR",
 			Message: "internal server error",
 		})
 	}

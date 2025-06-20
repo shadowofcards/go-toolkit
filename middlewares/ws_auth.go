@@ -12,6 +12,7 @@ import (
 	apperr "github.com/shadowofcards/go-toolkit/errors"
 	gtkjwt "github.com/shadowofcards/go-toolkit/jwt"
 	"github.com/shadowofcards/go-toolkit/logging"
+	"github.com/shadowofcards/go-toolkit/metrics"
 	"github.com/shadowofcards/go-toolkit/websocket"
 	"go.uber.org/zap"
 )
@@ -59,6 +60,7 @@ type WSAuthMiddleware struct {
 	appName      string
 	env          string
 	maxTokenAge  time.Duration
+	rec          metrics.Recorder
 }
 
 func NewWSAuthMiddleware(
@@ -66,6 +68,7 @@ func NewWSAuthMiddleware(
 	verifier *gtkjwt.Verifier,
 	serviceToken, appName, env string,
 	maxTokenAge time.Duration,
+	rec metrics.Recorder,
 	opts ...WSAuthOption,
 ) *WSAuthMiddleware {
 	m := &WSAuthMiddleware{
@@ -75,6 +78,7 @@ func NewWSAuthMiddleware(
 		appName:      appName,
 		env:          env,
 		maxTokenAge:  maxTokenAge,
+		rec:          rec,
 	}
 	for _, o := range opts {
 		o(m)
@@ -86,15 +90,33 @@ func (a *WSAuthMiddleware) Middleware() websocket.Middleware {
 	return func(next http.HandlerFunc) http.HandlerFunc {
 		return func(w http.ResponseWriter, r *http.Request) {
 			ctx := r.Context()
+			remoteIP := r.RemoteAddr
+			userAgent := r.Header.Get("User-Agent")
+			protocol := "ws"
+			if r.TLS != nil {
+				protocol = "wss"
+			}
+			tags := map[string]string{
+				"path":      r.URL.Path,
+				"protocol":  protocol,
+				"ip":        remoteIP,
+				"useragent": userAgent,
+				"caller":    r.Header.Get("X-Caller-ID"),
+				"app":       a.appName,
+			}
 
 			token := r.URL.Query().Get("token")
 			if token == "" {
+				tags["result"] = "missing_token"
+				a.rec.IncWithTags(ctx, "ws_auth_attempt_total", 1, tags)
 				writeError(w, ErrMissingToken)
 				a.log.WarnCtx(ctx, "missing token query parameter")
 				return
 			}
 
 			if strings.EqualFold(token, a.serviceToken) {
+				tags["result"] = "service_token"
+				a.rec.IncWithTags(ctx, "ws_auth_attempt_total", 1, tags)
 				ctx = context.WithValue(ctx, contexts.KeyUserID, a.appName)
 				ctx = context.WithValue(ctx, contexts.KeyUsername, a.appName)
 				ctx = context.WithValue(ctx, contexts.KeyUserRoles, []string{"service"})
@@ -105,6 +127,8 @@ func (a *WSAuthMiddleware) Middleware() websocket.Middleware {
 
 			if a.introspector != nil {
 				if _, err := a.introspector.Introspect(ctx, token); err != nil {
+					tags["result"] = "introspection_failed"
+					a.rec.IncWithTags(ctx, "ws_auth_attempt_total", 1, tags)
 					a.log.WarnCtx(ctx, "token introspection failed", zap.Error(err))
 					writeError(w, ErrInvalidToken)
 					return
@@ -114,6 +138,8 @@ func (a *WSAuthMiddleware) Middleware() websocket.Middleware {
 			var claims wsJWTClaims
 			allowExpired := a.env != "production"
 			if err := a.verifier.Validate(ctx, token, &claims, allowExpired); err != nil {
+				tags["result"] = "jwt_invalid"
+				a.rec.IncWithTags(ctx, "ws_auth_attempt_total", 1, tags)
 				a.log.WarnCtx(ctx, "jwt validation failed", zap.Error(err))
 				writeError(w, ErrInvalidToken)
 				return
@@ -122,6 +148,8 @@ func (a *WSAuthMiddleware) Middleware() websocket.Middleware {
 			if a.maxTokenAge > 0 && claims.IssuedAt != nil {
 				age := time.Since(claims.IssuedAt.Time)
 				if age > a.maxTokenAge {
+					tags["result"] = "token_expired"
+					a.rec.IncWithTags(ctx, "ws_auth_attempt_total", 1, tags)
 					a.log.WarnCtx(ctx, "token expired by age")
 					writeError(w, ErrTokenExpiredByAge)
 					return
@@ -133,6 +161,8 @@ func (a *WSAuthMiddleware) Middleware() websocket.Middleware {
 				userID = claims.PlayerID
 			}
 			if userID == "" {
+				tags["result"] = "missing_claim"
+				a.rec.IncWithTags(ctx, "ws_auth_attempt_total", 1, tags)
 				writeError(w, ErrMissingClaim)
 				a.log.WarnCtx(ctx, "no subject or player_id in token")
 				return
@@ -145,6 +175,10 @@ func (a *WSAuthMiddleware) Middleware() websocket.Middleware {
 			ctx = context.WithValue(ctx, contexts.KeyUserID, userID)
 			ctx = context.WithValue(ctx, contexts.KeyUsername, claims.PreferredUsername)
 			ctx = context.WithValue(ctx, contexts.KeyUserRoles, roles)
+
+			tags["result"] = "success"
+			tags["userid"] = userID
+			a.rec.IncWithTags(ctx, "ws_auth_attempt_total", 1, tags)
 
 			next(w, r.WithContext(ctx))
 		}
